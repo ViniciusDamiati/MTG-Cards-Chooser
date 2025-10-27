@@ -1,0 +1,4 @@
+InputCardsFile=C:\Users\vinic\Desktop\tyvar_deck_list.txt
+SourceFolder=G:\My Drive\Magic the Gathering\Proxies\Singles to print
+OutputFolder=C:\Users\vinic\Desktop\output
+MissingCardsReport=missing_cards.txt
