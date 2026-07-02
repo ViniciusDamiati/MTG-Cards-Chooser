@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using ManagedCuda;
 using ManagedCuda.BasicTypes;
@@ -35,19 +36,38 @@ namespace CardChooser.Services
         private const string CudaToolkitRoot =
             @"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA";
 
-        private readonly PrimaryContext _ctx;
-        private readonly NppStreamContext _streamCtx;
+        // ── Multi-stream parallelism ─────────────────────────────────────────
+        // Number of concurrent CUDA streams (= max images processed in parallel).
+        // RTX 3080 has 68 SM units — 4 concurrent streams saturate the GPU while
+        // keeping VRAM usage well within the 10 GB budget per pipeline slot:
+        //   Resize buffer (37 MB) + crop buffer (14 MB) + work buffers (~15 MB) ≈ 66 MB/stream
+        //   4 streams × 66 MB = ~264 MB — negligible on 10 GB VRAM.
+        private const int GpuStreamCount = 4;
 
-        // A single mutex ensures the GPU is used by exactly one CPU thread at a time,
-        // which matters when Parallel.ForEachAsync calls ProcessOnGpu concurrently.
-        private readonly SemaphoreSlim _gpuLock = new SemaphoreSlim(1, 1);
+        private readonly PrimaryContext _ctx;
+
+        // Pool of (stream, NPP stream context) pairs.  The pool always contains exactly
+        // GpuStreamCount entries; the semaphore ensures we never over-subscribe it.
+        private readonly ConcurrentQueue<(CudaStream Stream, NppStreamContext Ctx)> _streamPool = new();
+
+        // Owned stream objects — disposed when the pipeline is disposed.
+        private readonly List<CudaStream> _ownedStreams = new(GpuStreamCount);
+
+        // Semaphore(N, N) allows up to GpuStreamCount concurrent ProcessOnGpu calls.
+        private readonly SemaphoreSlim _gpuLock = new SemaphoreSlim(GpuStreamCount, GpuStreamCount);
 
         private bool _disposed;
 
-        private CudaNppImagePipeline(PrimaryContext ctx, NppStreamContext streamCtx)
+        /// <summary>
+        /// Number of images that can be processed simultaneously on the GPU.
+        /// Pass this to <see cref="System.Threading.Tasks.ParallelOptions.MaxDegreeOfParallelism"/>
+        /// when driving the pipeline from <c>Parallel.ForEachAsync</c>.
+        /// </summary>
+        public int Parallelism => GpuStreamCount;
+
+        private CudaNppImagePipeline(PrimaryContext ctx)
         {
-            _ctx       = ctx;
-            _streamCtx = streamCtx;
+            _ctx = ctx;
         }
 
         // ════════════════════════════════════════════════════════════════════
@@ -93,10 +113,19 @@ namespace CardChooser.Services
                 var ctx = new PrimaryContext(gpuIndex);
                 ctx.SetCurrent();
 
-                // ── Step 4: create NPP stream context ─────────────────────────────────
-                // NullStream = synchronous execution; all NPP calls block until done.
-                var streamCtx = new NppStreamContext(CUstream.NullStream);
-                return new CudaNppImagePipeline(ctx, streamCtx);
+                // ── Step 4: create the stream pool ────────────────────────────────────
+                // Each stream allows one image to be in-flight on the GPU concurrently.
+                // NppStreamContext is created per-stream so NPP operations are enqueued
+                // on their respective streams and can run in parallel on the GPU.
+                var pipeline = new CudaNppImagePipeline(ctx);
+                for (int i = 0; i < GpuStreamCount; i++)
+                {
+                    var stream    = new CudaStream();
+                    var streamCtx = new NppStreamContext(stream.Stream);
+                    pipeline._streamPool.Enqueue((stream, streamCtx));
+                    pipeline._ownedStreams.Add(stream);
+                }
+                return pipeline;
             }
             catch
             {
@@ -233,14 +262,27 @@ namespace CardChooser.Services
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
+            // The semaphore limits concurrent GPU users to GpuStreamCount.
+            // Because the pool has exactly GpuStreamCount entries, TryDequeue
+            // is guaranteed to succeed immediately after acquiring the semaphore.
             _gpuLock.Wait();
             try
             {
                 _ctx.SetCurrent(); // Bind CUDA context to this CPU thread
-                return RunGpuPipeline(source,
-                                      targetW, targetH,
-                                      cropX, cropY, cropW, cropH,
-                                      sharpenKernel3x3);
+
+                _streamPool.TryDequeue(out var entry);
+                try
+                {
+                    return RunGpuPipeline(source,
+                                          targetW, targetH,
+                                          cropX, cropY, cropW, cropH,
+                                          sharpenKernel3x3,
+                                          entry.Stream, entry.Ctx);
+                }
+                finally
+                {
+                    _streamPool.Enqueue(entry); // return stream to pool
+                }
             }
             finally
             {
@@ -257,27 +299,30 @@ namespace CardChooser.Services
             int targetW, int targetH,
             int cropX,   int cropY,
             int cropW,   int cropH,
-            float[] kernel)
+            float[] kernel,
+            CudaStream stream, NppStreamContext streamCtx)
         {
             // ── 1. SKBitmap (BGRA 8888) → contiguous BGR byte[] ──────────────
-            //    NPPImage_8uC3 is 3-channel BGR; we strip the Alpha byte here.
             byte[] srcBgr = BgraToRgb(source);
 
-            // ── 2. Upload BGR to GPU (cuMemcpy2D handles pitch alignment) ─────
+            // ── 2. Upload BGR to GPU ──────────────────────────────────────────
             using var gpuSrc = new NPPImage_8uC3(source.Width, source.Height);
             gpuSrc.CopyToDevice(srcBgr);
 
-            // ── 3. Resize on GPU: Cubic ≈ Catmull-Rom ────────────────────────
+            // ── 3. Resize on GPU (named stream — runs concurrently with other streams) ──
             using var gpuResized = new NPPImage_8uC3(targetW, targetH);
-            gpuSrc.Resize(gpuResized, InterpolationMode.Cubic, _streamCtx);
+            gpuSrc.Resize(gpuResized, InterpolationMode.Cubic, streamCtx);
+
+            // Flush stream before DtoH transfer.
+            // cuMemcpyDtoH is synchronous only with the null stream; for named
+            // streams we must explicitly wait for queued GPU work to finish.
+            stream.Synchronize();
 
             // ── 4. Crop via CPU round-trip ────────────────────────────────────
-            //    nppiCopy_8u_C3R cannot be reliably resolved at runtime:
-            //    - ManagedCuda 2.12.0 imports it from nppidei64_13 (wrong DLL)
-            //    - It is also absent from nppig64_13 on some CUDA 12.x builds
-            //    Rather than chasing per-version DLL routing, we do the crop on
-            //    the CPU.  PCIe cost: ~3 ms (37 MB ↓ + 14 MB ↑ on PCIe 4.0) —
-            //    negligible compared to the AI SR time (~10 s per card).
+            //    nppiCopy_8u_C3R is absent from both nppidei64_13 and nppig64_13
+            //    on CUDA 12.x — avoid the function entirely.
+            //    While this thread waits for the CPU crop, other streams continue
+            //    their own GPU work on different SM units (true GPU parallelism).
             byte[] resizedBgr = new byte[targetW * targetH * 3];
             gpuResized.CopyToHost(resizedBgr);
 
@@ -286,29 +331,31 @@ namespace CardChooser.Services
             using var gpuCropped = new NPPImage_8uC3(cropW, cropH);
             gpuCropped.CopyToDevice(croppedBgr);
 
-            // ── 5. Gaussian denoise on GPU (3×3, Reflect boundary) ────────────
+            // ── 5. Gaussian denoise on GPU ────────────────────────────────────
             using var gpuBlurred = new NPPImage_8uC3(cropW, cropH);
             gpuCropped.FilterGaussBorder(
                 gpuBlurred, MaskSize.Size_3_X_3,
-                NppiBorderType.Replicate, _streamCtx,
+                NppiBorderType.Replicate, streamCtx,
                 new NppiRect(0, 0, cropW, cropH));
 
-            // ── 6. Laplacian sharpen on GPU (custom 3×3 float kernel) ─────────
-            //    Uploads kernel to GPU device memory, then runs FilterBorder.
+            // ── 6. Laplacian sharpen on GPU ───────────────────────────────────
             using var gpuSharpened = new NPPImage_8uC3(cropW, cropH);
             using var gpuKernel    = new CudaDeviceVariable<float>(kernel.Length);
             gpuKernel.CopyToDevice(kernel);
             gpuBlurred.FilterBorder(
                 gpuSharpened, gpuKernel,
                 new NppiSize(3, 3), new NppiPoint(1, 1),
-                NppiBorderType.Replicate, _streamCtx,
+                NppiBorderType.Replicate, streamCtx,
                 new NppiRect(0, 0, cropW, cropH));
 
-            // ── 7. Download from GPU ─────────────────────────────────────────
+            // Flush before final DtoH transfer.
+            stream.Synchronize();
+
+            // ── 7. Download from GPU ──────────────────────────────────────────
             byte[] dstBgr = new byte[cropW * cropH * 3];
             gpuSharpened.CopyToHost(dstBgr);
 
-            // ── 8. BGR → SKBitmap (BGRA 8888, Alpha = 255) ──────────────────
+            // ── 8. BGR → SKBitmap (BGRA 8888, Alpha = 255) ───────────────────
             return RgbToSKBitmap(dstBgr, cropW, cropH);
         }
 
@@ -391,6 +438,10 @@ namespace CardChooser.Services
             if (!_disposed)
             {
                 _gpuLock.Dispose();
+                // Dispose all owned CUDA streams (releases GPU stream handles)
+                foreach (CudaStream s in _ownedStreams)
+                    s.Dispose();
+                _ownedStreams.Clear();
                 _ctx.Dispose();
                 _disposed = true;
             }

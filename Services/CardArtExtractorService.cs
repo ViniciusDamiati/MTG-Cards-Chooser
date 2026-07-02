@@ -142,7 +142,9 @@ namespace CardChooser.Services
             Console.WriteLine($"  Denoise + sharpen   : ON (always)");
             Console.WriteLine($"  Concurrency         : {(aiSrAvailable
                 ? $"GPU+CPU pipeline (channel depth {SrChannelCapacity})"
-                : $"CPU parallel ({CpuParallelism} cores, Parallel.ForEachAsync)")}");
+                : cuda != null
+                    ? $"GPU parallel ({cuda.Parallelism} concurrent CUDA streams + Parallel.ForEachAsync)"
+                    : $"CPU parallel ({CpuParallelism} cores, Parallel.ForEachAsync)")}");
             Console.WriteLine($"  Output folder       : {artOutputFolder}");
             Console.WriteLine();
 
@@ -235,8 +237,13 @@ namespace CardChooser.Services
         }
 
         /// <summary>
-        /// CPU-only path (no AI SR): all images are processed in parallel across
-        /// <see cref="CpuParallelism"/> cores using <see cref="Parallel.ForEachAsync"/>.
+        /// Parallel path (no AI SR): processes all images concurrently.
+        /// <list type="bullet">
+        ///   <item>CUDA available → <c>cuda.Parallelism</c> concurrent streams (default 4 on RTX 3080).
+        ///         Each thread owns one CUDA stream; GPU SM units are shared across streams, allowing
+        ///         true parallel execution of Resize / Denoise / Sharpen on different images.</item>
+        ///   <item>CUDA unavailable → <c>CpuParallelism</c> (½ × logical cores) SkiaSharp threads.</item>
+        /// </list>
         /// </summary>
         private static async Task<(int successes, int failures)> RunParallelCpuAsync(
             IReadOnlyList<string> imageFiles,
@@ -246,9 +253,14 @@ namespace CardChooser.Services
         {
             int successes = 0, failures = 0;
 
+            // Use the CUDA stream count when GPU is available so the degree of parallelism
+            // matches the number of independent streams — avoids over-subscribing the GPU
+            // while ensuring every stream slot is kept busy.
+            int parallelism = cuda?.Parallelism ?? CpuParallelism;
+
             await Parallel.ForEachAsync(
                 imageFiles,
-                new ParallelOptions { MaxDegreeOfParallelism = CpuParallelism },
+                new ParallelOptions { MaxDegreeOfParallelism = parallelism },
                 async (imageFile, _) =>
                 {
                     string cardFileName = Path.GetFileName(imageFile);
