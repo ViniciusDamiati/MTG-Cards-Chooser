@@ -402,12 +402,25 @@ namespace CardChooser.Services
             return bgr;
         }
 
-        /// <summary>BGR 24-bit → BGRA 8888 SKBitmap (Alpha = 255, fully opaque).</summary>
+        /// <summary>
+        /// BGR 24-bit → BGRA 8888 SKBitmap (Alpha = 255, fully opaque).
+        ///
+        /// <b>Why not <c>InstallPixels</c> + <c>GCHandle</c>?</b>
+        /// <c>InstallPixels</c> does NOT copy the pixels — it stores the raw pointer.
+        /// Calling <c>handle.Free()</c> immediately after unpins the managed byte array;
+        /// the GC is then free to move it, and any later access (e.g. <c>SKImage.FromBitmap</c>
+        /// on a different thread) causes a 0xC0000005 access violation.
+        ///
+        /// The safe pattern: let <c>SKBitmap(info)</c> allocate its own native pixel buffer,
+        /// then copy our BGRA bytes into it with <c>Marshal.Copy</c>.  The bitmap owns the
+        /// memory and it never moves.
+        /// </summary>
         private static SKBitmap RgbToSKBitmap(byte[] bgr, int width, int height)
         {
             var info = new SKImageInfo(width, height, SKColorType.Bgra8888, SKAlphaType.Opaque);
-            var bmp  = new SKBitmap(info);
+            var bmp  = new SKBitmap(info); // allocates its own native pixel buffer
 
+            // Build the BGRA array and copy into the bitmap's own buffer.
             byte[] bgra = new byte[width * height * 4];
             for (int s = 0, d = 0; s < bgr.Length; s += 3, d += 4)
             {
@@ -417,16 +430,11 @@ namespace CardChooser.Services
                 bgra[d + 3] = 255; // Alpha = fully opaque
             }
 
-            var handle = GCHandle.Alloc(bgra, GCHandleType.Pinned);
-            try
-            {
-                bmp.InstallPixels(info, handle.AddrOfPinnedObject(), info.RowBytes);
-                return bmp;
-            }
-            finally
-            {
-                handle.Free();
-            }
+            // Copy into the bitmap's own native allocation — no GCHandle needed.
+            IntPtr pixPtr = bmp.GetPixels();
+            System.Runtime.InteropServices.Marshal.Copy(bgra, 0, pixPtr, bgra.Length);
+            bmp.NotifyPixelsChanged();
+            return bmp;
         }
 
         // ════════════════════════════════════════════════════════════════════
