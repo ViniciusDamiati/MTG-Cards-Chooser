@@ -36,9 +36,9 @@ namespace CardChooser.Services
         // Calibrated against Photoshop Image Size dialog (2527 × 1827 px @ 1200 DPI = 2.106" × 1.523").
         // Boundaries measured on a 672×936 Scryfall 'large' JPEG source.
         private const double ArtFrameLeft   = 0.077;   //  7.70 % →  231 px (left edge of art)
-        private const double ArtFrameTop    = 0.135;   // 13.50 % →  562 px (below name bar)
+        private const double ArtFrameTop    = 0.1169;  // 11.69 % →  486 px (shifted 75 px up from 561)
         private const double ArtFrameWidth  = 0.8425;  // 84.25 % → 2527 px ← Photoshop verified
-        private const double ArtFrameHeight = 0.4394;  // 43.94 % → 1827 px ← Photoshop verified
+        private const double ArtFrameHeight = 0.4394;  // 43.94 % → 1827 px ← Photoshop verified (bottom @ 2313 px)
 
         // Expected dimensions — printed before enhancement as a sanity check.
         private const int ExpectedArtWidth  = 2527;
@@ -474,9 +474,9 @@ namespace CardChooser.Services
         private static SKRectI ComputeArtCropRectangle()
         {
             int x      = (int)(TargetCardWidth  * ArtFrameLeft);    //  231 px
-            int y      = (int)(TargetCardHeight * ArtFrameTop);     //  562 px
+            int y      = (int)(TargetCardHeight * ArtFrameTop);     //  486 px  (75 px above previous 561)
             int width  = (int)(TargetCardWidth  * ArtFrameWidth);   // 2527 px
-            int height = (int)(TargetCardHeight * ArtFrameHeight);  // 1827 px
+            int height = (int)(TargetCardHeight * ArtFrameHeight);  // 1827 px  (bottom @ 2313 px)
             return new SKRectI(x, y, x + width, y + height);
         }
 
