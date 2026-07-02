@@ -226,8 +226,8 @@ namespace CardChooser.Services
                 if (ok) successes++;
                 else    failures++;
 
-                if (result.WasUpscaled && File.Exists(result.InputForProcessing))
-                    File.Delete(result.InputForProcessing);
+            if (result.WasUpscaled)
+                    TryDeleteTempFile(result.InputForProcessing);
             }
 
             await producer; // re-throw any unhandled producer exception
@@ -535,6 +535,39 @@ namespace CardChooser.Services
         {
             if (!Directory.Exists(path))
                 Directory.CreateDirectory(path);
+        }
+
+        /// <summary>
+        /// Best-effort deletion of a temp file with up to 3 retries spaced 200 ms apart.
+        /// Windows Defender / Search Indexer can briefly lock a newly-written file in %TEMP%
+        /// even after the writing process has exited.  Swallowing the exception is intentional:
+        /// by the time this is called the output art file has already been written successfully,
+        /// so a stale temp file is cosmetic, not fatal.
+        /// </summary>
+        private static void TryDeleteTempFile(string path)
+        {
+            const int maxAttempts  = 3;
+            const int retryDelayMs = 200;
+
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                try
+                {
+                    if (File.Exists(path))
+                        File.Delete(path);
+                    return; // success — exit immediately
+                }
+                catch (IOException) when (attempt < maxAttempts - 1)
+                {
+                    // Transient lock (antivirus / indexer) — wait briefly then retry
+                    Thread.Sleep(retryDelayMs);
+                }
+                catch
+                {
+                    // Give up silently on any other error (permissions, path too long, etc.)
+                    return;
+                }
+            }
         }
     }
 }
