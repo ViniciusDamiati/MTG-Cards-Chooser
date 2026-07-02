@@ -19,6 +19,31 @@ namespace CardChooser.Services
     /// </summary>
     internal sealed class CudaNppImagePipeline : IDisposable
     {
+        // ── NPP DLL discovery ────────────────────────────────────────────────
+        // The three unmanaged DLLs our pipeline needs (CUDA Toolkit 12.x).
+        private static readonly string[] RequiredNppDlls =
+        {
+            "nppisu64_13",   // stream-context utilities  (NppStreamContext)
+            "nppig64_13",    // geometry transforms       (Resize, Copy)
+            "nppif64_13",    // image filtering           (FilterGaussBorder, FilterBorder)
+        };
+
+        // Well-known CUDA Toolkit installation paths on Windows, newest first.
+        // Checked only when the DLLs are not already resolvable via PATH / system dirs.
+        private static readonly string[] CudaBinSearchPaths =
+            Enumerable.Range(0, 8)                       // v13.0 … v12.0 (minor revisions ignored)
+                .SelectMany(i => new[]
+                {
+                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.0\bin",
+                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.6\bin",
+                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.5\bin",
+                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.4\bin",
+                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.3\bin",
+                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.2\bin",
+                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.1\bin",
+                })
+                .ToArray();
+
         private readonly PrimaryContext _ctx;
         private readonly NppStreamContext _streamCtx;
 
@@ -48,20 +73,17 @@ namespace CardChooser.Services
             try
             {
                 // ── Step 1: pre-check unmanaged NPP DLL presence ──────────────────────
-                // We use NativeLibrary.TryLoad BEFORE accessing any NPP managed types
-                // (NppStreamContext, NPPImage_8uC3, etc.).  Accessing those types would
-                // immediately trigger a DllNotFoundException that can escape a try/catch
-                // if the CLR fails to load the assembly-bound unmanaged DLLs at type-init
-                // time.  TryLoad is silent: it returns false instead of throwing.
+                // We probe the DLLs BEFORE accessing any NPP managed type, because
+                // accessing NppStreamContext / NPPImage_8uC3 triggers CLR type-init which
+                // can throw DllNotFoundException before our try/catch is in scope.
                 //
-                // DLLs required by our pipeline (CUDA Toolkit 12.x, installed separately
-                // from the NVIDIA display driver):
-                //   nppisu64_13  — NPP stream-context utilities  (NppStreamContext)
-                //   nppig64_13   — NPP geometry transforms       (Resize, Copy)
-                //   nppif64_13   — NPP image filtering           (FilterGaussBorder, FilterBorder)
-                if (!NativeLibrary.TryLoad("nppisu64_13", out _)) return null;
-                if (!NativeLibrary.TryLoad("nppig64_13",  out _)) return null;
-                if (!NativeLibrary.TryLoad("nppif64_13",  out _)) return null;
+                // Strategy:
+                //   a) Try PATH / system dirs first (works when CUDA\vX.Y\bin is in PATH).
+                //   b) If any DLL is missing via PATH, scan well-known CUDA Toolkit install
+                //      directories (the installer often skips adding them to PATH).
+                //      Load each DLL from its full absolute path so the CLR can find it.
+                if (!EnsureNppDllsLoaded(out string nppSource)) return null;
+                Console.WriteLine($"    CUDA NPP DLLs : loaded from {nppSource}");
 
                 // ── Step 2: check that a CUDA device is present ───────────────────────
                 // GetDeviceCount() calls cuInit() implicitly via nvcuda.dll (ships with
@@ -89,6 +111,77 @@ namespace CardChooser.Services
         {
             try { return CudaContext.GetDeviceName(gpuIndex); }
             catch { return "unknown GPU"; }
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // NPP DLL discovery helpers
+        // ════════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Ensures all three required NPP DLLs are loaded into the process before any NPP
+        /// managed type is first accessed.
+        ///
+        /// <para>Strategy (two passes):</para>
+        /// <list type="number">
+        ///   <item>Try <see cref="NativeLibrary.TryLoad(string, out IntPtr)"/> for each DLL —
+        ///         succeeds when the CUDA Toolkit <c>bin\</c> directory is in <c>PATH</c>.</item>
+        ///   <item>If any DLL is not found via PATH, walk <see cref="CudaBinSearchPaths"/> and
+        ///         attempt to load each DLL by its full absolute path — succeeds when the
+        ///         Toolkit is installed but its directory was not added to <c>PATH</c>
+        ///         (common with the silent/default installer on Windows).</item>
+        /// </list>
+        /// </summary>
+        /// <param name="source">
+        ///   On success: <c>"PATH"</c> or the absolute CUDA <c>bin\</c> directory that was used.
+        ///   On failure: a human-readable explanation of which DLL was not found.
+        /// </param>
+        /// <returns><c>true</c> if every DLL was loaded; <c>false</c> otherwise.</returns>
+        private static bool EnsureNppDllsLoaded(out string source)
+        {
+            // ── Pass 1: PATH / system-directory search ────────────────────────
+            if (RequiredNppDlls.All(dll => NativeLibrary.TryLoad(dll, out _)))
+            {
+                source = "PATH";
+                return true;
+            }
+
+            // ── Pass 2: well-known CUDA Toolkit install directories ────────────
+            // The CUDA Toolkit installer often does NOT add its bin\ folder to PATH,
+            // so NativeLibrary.TryLoad by name fails even when the DLLs exist on disk.
+            // Loading by full absolute path bypasses the PATH requirement.
+            foreach (string dir in CudaBinSearchPaths)
+            {
+                if (!Directory.Exists(dir)) continue;
+
+                bool allFound = RequiredNppDlls.All(dll =>
+                {
+                    string fullPath = Path.Combine(dir, dll + ".dll");
+                    return File.Exists(fullPath) && NativeLibrary.TryLoad(fullPath, out _);
+                });
+
+                if (allFound)
+                {
+                    source = dir;
+                    return true;
+                }
+            }
+
+            // ── Not found — build a diagnostic message ─────────────────────────
+            string missing = string.Join(", ",
+                RequiredNppDlls.Where(dll =>
+                {
+                    bool inPath = NativeLibrary.TryLoad(dll, out _);
+                    bool inDirs = CudaBinSearchPaths
+                        .Any(d => File.Exists(Path.Combine(d, dll + ".dll")));
+                    return !inPath && !inDirs;
+                })
+                .Select(dll => dll + ".dll"));
+
+            source = string.IsNullOrEmpty(missing)
+                ? "DLLs found on disk but could not be loaded (check architecture / corruption)"
+                : $"missing: {missing} — install CUDA Toolkit 12.x from https://developer.nvidia.com/cuda-downloads";
+
+            return false;
         }
 
         // ════════════════════════════════════════════════════════════════════
