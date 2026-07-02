@@ -29,6 +29,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="ManagedCuda-13" Version="13.0.64" />
+    <PackageReference Include="ManagedCuda-NPP" Version="13.0.64" />
     <PackageReference Include="SkiaSharp" Version="4.148.0" />
   </ItemGroup>
 

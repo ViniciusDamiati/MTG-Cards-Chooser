@@ -64,10 +64,10 @@ namespace CardChooser.Services
         private const string AiSrModelsFolder = "realesrgan-models";
 
         // Model selection — change to any model in realesrgan-models/:
-        //   realesr-animevideov3   — fast, painted/anime art  (1.2 MB, default)
-        //   realesrgan-x4plus-anime — higher quality illustration (8.9 MB)
-        //   realesrgan-x4plus      — photo-realistic images  (33 MB)
-        private const string AiSrModelName = "realesr-animevideov3";
+        //   realesr-animevideov3    — fast, anime/cel-shading (1.2 MB) — over-smooths painted art
+        //   realesrgan-x4plus-anime — higher-quality illustration (8.9 MB)
+        //   realesrgan-x4plus       — photo-realistic / digital painting (33 MB) ← best for MTG art
+        private const string AiSrModelName = "realesrgan-x4plus";
         private const int    AiSrScale     = 4;
 
         // ── GPU optimisation flags ────────────────────────────────────────────
@@ -126,10 +126,19 @@ namespace CardChooser.Services
             }
 
             bool aiSrAvailable = IsAiSrToolAvailable();
+
+            // Initialise the CUDA NPP image pipeline (requires CUDA Toolkit 12.3+).
+            // Returns null silently if CUDA is unavailable; all methods fall back to SkiaSharp.
+            using CudaNppImagePipeline? cuda = CudaNppImagePipeline.TryCreate(AiSrGpuId);
+            string gpuImgProc = cuda != null
+                ? $"ON  (CUDA NPP — {CudaNppImagePipeline.GetDeviceName(AiSrGpuId)})"
+                : "OFF (CUDA Toolkit 12.3+ not found — using SkiaSharp CPU)";
+
             Console.WriteLine($"Extracting card art from {imageFiles.Count} image(s)...");
             Console.WriteLine($"  AI super-resolution : {(aiSrAvailable
                 ? $"ON  — GPU {AiSrGpuId}, model={AiSrModelName}, tile=auto (10 GB VRAM), threads={AiSrThreadConfig}"
                 : "OFF (realesrgan-ncnn-vulkan.exe not found)")}");
+            Console.WriteLine($"  GPU image processing: {gpuImgProc}");
             Console.WriteLine($"  Denoise + sharpen   : ON (always)");
             Console.WriteLine($"  Concurrency         : {(aiSrAvailable
                 ? $"GPU+CPU pipeline (channel depth {SrChannelCapacity})"
@@ -143,12 +152,12 @@ namespace CardChooser.Services
             if (aiSrAvailable)
             {
                 (successCount, failureCount) =
-                    await RunPipelineWithSrAsync(imageFiles, artOutputFolder, cropRect);
+                    await RunPipelineWithSrAsync(imageFiles, artOutputFolder, cropRect, cuda);
             }
             else
             {
                 (successCount, failureCount) =
-                    await RunParallelCpuAsync(imageFiles, artOutputFolder, cropRect);
+                    await RunParallelCpuAsync(imageFiles, artOutputFolder, cropRect, cuda);
             }
 
             Console.WriteLine();
@@ -176,7 +185,8 @@ namespace CardChooser.Services
         private static async Task<(int successes, int failures)> RunPipelineWithSrAsync(
             IReadOnlyList<string> imageFiles,
             string artOutputFolder,
-            SKRectI cropRect)
+            SKRectI cropRect,
+            CudaNppImagePipeline? cuda)
         {
             var channel = Channel.CreateBounded<SrResult>(new BoundedChannelOptions(SrChannelCapacity)
             {
@@ -212,7 +222,7 @@ namespace CardChooser.Services
 
             await foreach (SrResult result in channel.Reader.ReadAllAsync())
             {
-                bool ok = await TryCpuProcessAsync(result, artOutputFolder, cropRect);
+                bool ok = await TryCpuProcessAsync(result, artOutputFolder, cropRect, cuda);
                 if (ok) successes++;
                 else    failures++;
 
@@ -231,7 +241,8 @@ namespace CardChooser.Services
         private static async Task<(int successes, int failures)> RunParallelCpuAsync(
             IReadOnlyList<string> imageFiles,
             string artOutputFolder,
-            SKRectI cropRect)
+            SKRectI cropRect,
+            CudaNppImagePipeline? cuda)
         {
             int successes = 0, failures = 0;
 
@@ -245,7 +256,7 @@ namespace CardChooser.Services
                                               WasUpscaled: false,
                                               StatusPrefix: $"  '{cardFileName}'");
 
-                    bool ok = await TryCpuProcessAsync(result, artOutputFolder, cropRect);
+                    bool ok = await TryCpuProcessAsync(result, artOutputFolder, cropRect, cuda);
                     if (ok) Interlocked.Increment(ref successes);
                     else    Interlocked.Increment(ref failures);
                 });
@@ -263,13 +274,16 @@ namespace CardChooser.Services
         private static async Task<bool> TryCpuProcessAsync(
             SrResult result,
             string artOutputFolder,
-            SKRectI cropRect)
+            SKRectI cropRect,
+            CudaNppImagePipeline? cuda)
         {
             try
             {
-                // Offload CPU-intensive work to the thread pool
+                // Offload image-processing work to the thread pool.
+                // When cuda != null the GPU stages execute inside Task.Run (holding the GPU lock);
+                // when null, the SkiaSharp CPU stages execute there instead.
                 byte[] jpegBytes = await Task.Run(() =>
-                    ProcessCardImageToBytes(result.InputForProcessing, cropRect));
+                    ProcessCardImageToBytes(result.InputForProcessing, cropRect, cuda));
 
                 SetJfifDpi(jpegBytes, TargetDpi);
 
@@ -290,42 +304,69 @@ namespace CardChooser.Services
         // Image processing (synchronous, runs on thread pool via Task.Run)
         // ════════════════════════════════════════════════════════════════════
 
-        private static byte[] ProcessCardImageToBytes(string sourceImagePath, SKRectI cropRect)
+        private static byte[] ProcessCardImageToBytes(
+            string sourceImagePath, SKRectI cropRect, CudaNppImagePipeline? cuda)
         {
-            // 1. Load
+            // 1. Load from disk (common to both paths)
             using SKBitmap source = SKBitmap.Decode(sourceImagePath)
                 ?? throw new InvalidOperationException(
                     $"SkiaSharp could not decode '{Path.GetFileName(sourceImagePath)}'.");
 
-            // 2. Resize to 3000 × 4159 using Catmull-Rom cubic resampling
-            var targetInfo = new SKImageInfo(TargetCardWidth, TargetCardHeight,
-                                             source.ColorType, source.AlphaType);
-            using SKBitmap resized = source.Resize(targetInfo,
-                                         new SKSamplingOptions(SKCubicResampler.CatmullRom))
-                ?? throw new InvalidOperationException("Resize returned null.");
+            if (cuda != null)
+            {
+                // ── GPU path (CUDA NPP): resize + crop + denoise + sharpen on CUDA cores ─────
+                // ProcessOnGpu acquires an internal lock, so concurrent Task.Run calls are safe.
+                using SKBitmap artBitmap = cuda.ProcessOnGpu(
+                    source,
+                    TargetCardWidth, TargetCardHeight,
+                    cropRect.Left, cropRect.Top, cropRect.Width, cropRect.Height,
+                    SharpenKernel);
 
-            // 3. Crop to M15 art frame
-            using SKBitmap artBitmap = ExtractCrop(resized, cropRect);
+                LogCropSize(artBitmap);
+                return EncodeToJpeg(artBitmap);
+            }
+            else
+            {
+                // ── CPU path (SkiaSharp): original pipeline ────────────────────────────────
+                // 2. Resize to 3000 × 4159 using Catmull-Rom cubic resampling
+                var targetInfo = new SKImageInfo(TargetCardWidth, TargetCardHeight,
+                                                 source.ColorType, source.AlphaType);
+                using SKBitmap resized = source.Resize(targetInfo,
+                                             new SKSamplingOptions(SKCubicResampler.CatmullRom))
+                    ?? throw new InvalidOperationException("Resize returned null.");
 
-            // ── Verification: log crop size before enhancement ─────────────
+                // 3. Crop to M15 art frame
+                using SKBitmap artBitmap = ExtractCrop(resized, cropRect);
+                LogCropSize(artBitmap);
+
+                // 4. Denoise — Gaussian blur (σ = 0.5)
+                using SKBitmap denoised = ApplyBlur(artBitmap, DenoiseSigma);
+
+                // 5. Sharpen — 3×3 Laplacian unsharp-mask
+                using SKBitmap sharpened = ApplySharpen(denoised);
+
+                // 6. JPEG encode
+                return EncodeToJpeg(sharpened);
+            }
+        }
+
+        /// <summary>Logs the crop dimensions and emits a warning if they deviate from expected.</summary>
+        private static void LogCropSize(SKBitmap artBitmap)
+        {
             // Expected: 2527 × 1827 px @ 1200 DPI (≈ 2.106" × 1.523", verified in Photoshop).
-            bool cropOk = artBitmap.Width == ExpectedArtWidth && artBitmap.Height == ExpectedArtHeight;
+            bool   cropOk   = artBitmap.Width == ExpectedArtWidth && artBitmap.Height == ExpectedArtHeight;
             string sizeLabel = cropOk
                 ? $"{artBitmap.Width} × {artBitmap.Height} px ✓"
                 : $"{artBitmap.Width} × {artBitmap.Height} px  ⚠ expected {ExpectedArtWidth} × {ExpectedArtHeight}";
             Console.WriteLine($"    crop size : {sizeLabel}");
+        }
 
-            // 4. Denoise — Gaussian blur (σ = 0.5)
-            using SKBitmap denoised = ApplyBlur(artBitmap, DenoiseSigma);
-
-            // 5. Sharpen — 3×3 Laplacian unsharp-mask
-            using SKBitmap sharpened = ApplySharpen(denoised);
-
-            // 6. JPEG encode
-            using SKImage artImage = SKImage.FromBitmap(sharpened);
+        /// <summary>Encodes a bitmap as JPEG at <see cref="JpegQuality"/> and returns the byte array.</summary>
+        private static byte[] EncodeToJpeg(SKBitmap bitmap)
+        {
+            using SKImage artImage = SKImage.FromBitmap(bitmap);
             using SKData  encoded  = artImage.Encode(SKEncodedImageFormat.Jpeg, JpegQuality)
                 ?? throw new InvalidOperationException("JPEG encoding returned null.");
-
             return encoded.ToArray();
         }
 
