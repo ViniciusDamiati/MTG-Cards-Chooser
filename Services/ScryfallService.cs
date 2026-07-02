@@ -54,17 +54,56 @@ namespace CardChooser.Services
 
             bool[] results = await Task.WhenAll(downloadTasks);
 
+            // Correlate each card name with its download result to identify failures
+            var failedCards = cardNames
+                .Zip(results, (name, succeeded) => (Name: name, Succeeded: succeeded))
+                .Where(pair => !pair.Succeeded)
+                .Select(pair => pair.Name)
+                .ToList();
+
             int successCount = results.Count(result => result);
-            int failureCount = results.Count(result => !result);
+            int failureCount = failedCards.Count;
 
             Console.WriteLine();
             Console.WriteLine($"Scryfall download complete: {successCount} succeeded, {failureCount} failed.");
+
+            if (failedCards.Count > 0)
+            {
+                await WriteFailedDownloadsReportAsync(failedCards, targetFolder);
+            }
+
             Console.WriteLine();
+        }
+
+        /// <summary>
+        /// Writes a plain-text report listing all cards whose images could not be downloaded.
+        /// The file is saved as "failed_downloads.txt" inside the target folder.
+        /// </summary>
+        /// <param name="failedCards">Names of cards that failed to download.</param>
+        /// <param name="targetFolder">The folder (same as the images folder) where the report is written.</param>
+        private static async Task WriteFailedDownloadsReportAsync(IReadOnlyList<string> failedCards, string targetFolder)
+        {
+            const string FailedDownloadsFileName = "failed_downloads.txt";
+            string reportPath = Path.Combine(targetFolder, FailedDownloadsFileName);
+
+            var lines = new List<string>
+            {
+                "Failed Downloads",
+                $"Generated: {DateTime.Now:yyyy-MM-dd HH:mm:ss}",
+                $"Total failed: {failedCards.Count}",
+                string.Empty
+            };
+            lines.AddRange(failedCards);
+
+            await File.WriteAllLinesAsync(reportPath, lines);
+            Console.WriteLine($"Failed downloads report saved to: {reportPath}");
         }
 
         /// <summary>
         /// Attempts to download the image for a single card: fetches card JSON, extracts the
         /// image URL, downloads the image bytes, and writes them to disk.
+        /// Writes a single complete console line with the card name and result together,
+        /// so that parallel downloads do not interleave names with wrong results.
         /// Returns <c>true</c> on success, <c>false</c> on any failure.
         /// </summary>
         /// <param name="cardName">The exact card name to look up on Scryfall.</param>
@@ -72,15 +111,13 @@ namespace CardChooser.Services
         /// <returns><c>true</c> if the image was saved successfully; otherwise <c>false</c>.</returns>
         private async Task<bool> TryDownloadCardImageAsync(string cardName, string targetFolder)
         {
-            Console.Write($"  Downloading image for '{cardName}'... ");
-
             try
             {
                 string? imageUrl = await FetchImageUrlAsync(cardName);
 
                 if (imageUrl == null)
                 {
-                    Console.WriteLine("FAILED (card not found or has no image)");
+                    Console.WriteLine($"  '{cardName}'... FAILED (card not found or has no image)");
                     return false;
                 }
 
@@ -89,17 +126,17 @@ namespace CardChooser.Services
                 string filePath = BuildImageFilePath(targetFolder, cardName);
                 await File.WriteAllBytesAsync(filePath, imageBytes);
 
-                Console.WriteLine("OK");
+                Console.WriteLine($"  '{cardName}'... OK");
                 return true;
             }
             catch (HttpRequestException ex)
             {
-                Console.WriteLine($"FAILED ({ex.StatusCode?.ToString() ?? ex.Message})");
+                Console.WriteLine($"  '{cardName}'... FAILED ({ex.StatusCode?.ToString() ?? ex.Message})");
                 return false;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"FAILED ({ex.Message})");
+                Console.WriteLine($"  '{cardName}'... FAILED ({ex.Message})");
                 return false;
             }
         }
