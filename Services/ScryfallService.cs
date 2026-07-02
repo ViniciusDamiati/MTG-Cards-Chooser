@@ -8,18 +8,25 @@ namespace CardChooser.Services
     /// Single Responsibility: All Scryfall API communication is encapsulated here.
     /// Strategy: fetch card JSON first to resolve the image URL, then download the image.
     /// This correctly handles both regular cards and double-faced cards (DFCs).
+    ///
+    /// All HTTP requests are throttled through a shared rate limiter so that no more than
+    /// 2 requests per second are sent (Scryfall's published limit). Cards are downloaded
+    /// concurrently via Task.WhenAll; the rate limiter acts as the shared bottleneck.
     /// </summary>
-    public class ScryfallService : IScryfallService, IDisposable
+    public class ScryfallService : IScryfallService
     {
         private const string ScryfallNamedCardBaseUrl = "https://api.scryfall.com/cards/named";
         private const string ImageSize = "large";
         private const string ImageExtension = ".jpg";
 
-        // Scryfall rate limit: 2 req/s. Each card makes 2 HTTP calls (JSON + image).
-        // Limiting to 2 concurrent card downloads keeps us at ~4 requests in-flight max.
-        private const int MaxConcurrentDownloads = 2;
+        // Scryfall rate limit: 2 requests/second (500ms between requests).
+        private static readonly TimeSpan RateLimitWindow = TimeSpan.FromMilliseconds(500);
 
         private readonly HttpClient _httpClient;
+
+        // Single-permit semaphore used as a rate limiter across ALL concurrent HTTP calls.
+        // A permit is released 500ms after it is acquired, ensuring ≤ 2 requests/second.
+        private readonly SemaphoreSlim _httpRateLimiter = new SemaphoreSlim(1, 1);
 
         public ScryfallService(HttpClient httpClient)
         {
@@ -40,10 +47,10 @@ namespace CardChooser.Services
             Console.WriteLine($"Downloading {cardNames.Count} missing card image(s) from Scryfall into '{targetFolder}'...");
             Console.WriteLine();
 
-            using var semaphore = new SemaphoreSlim(MaxConcurrentDownloads, MaxConcurrentDownloads);
-
+            // All cards are kicked off in parallel; the shared _httpRateLimiter ensures
+            // individual HTTP requests are spaced at least 500ms apart (≤ 2 req/s).
             IEnumerable<Task<bool>> downloadTasks = cardNames
-                .Select(cardName => DownloadWithThrottleAsync(cardName, targetFolder, semaphore));
+                .Select(cardName => TryDownloadCardImageAsync(cardName, targetFolder));
 
             bool[] results = await Task.WhenAll(downloadTasks);
 
@@ -53,23 +60,6 @@ namespace CardChooser.Services
             Console.WriteLine();
             Console.WriteLine($"Scryfall download complete: {successCount} succeeded, {failureCount} failed.");
             Console.WriteLine();
-        }
-
-        /// <summary>
-        /// Acquires the semaphore slot before downloading so that at most
-        /// <see cref="MaxConcurrentDownloads"/> card images are fetched in parallel.
-        /// </summary>
-        private async Task<bool> DownloadWithThrottleAsync(string cardName, string targetFolder, SemaphoreSlim semaphore)
-        {
-            await semaphore.WaitAsync();
-            try
-            {
-                return await TryDownloadCardImageAsync(cardName, targetFolder);
-            }
-            finally
-            {
-                semaphore.Release();
-            }
         }
 
         private async Task<bool> TryDownloadCardImageAsync(string cardName, string targetFolder)
@@ -86,7 +76,7 @@ namespace CardChooser.Services
                     return false;
                 }
 
-                byte[] imageBytes = await _httpClient.GetByteArrayAsync(imageUrl);
+                byte[] imageBytes = await ThrottledGetBytesAsync(imageUrl);
 
                 string filePath = BuildImageFilePath(targetFolder, cardName);
                 await File.WriteAllBytesAsync(filePath, imageBytes);
@@ -114,7 +104,7 @@ namespace CardChooser.Services
         {
             string requestUrl = BuildCardJsonUrl(cardName);
 
-            HttpResponseMessage response = await _httpClient.GetAsync(requestUrl);
+            HttpResponseMessage response = await ThrottledGetAsync(requestUrl);
 
             if (!response.IsSuccessStatusCode)
                 return null;
@@ -123,6 +113,42 @@ namespace CardChooser.Services
 
             using JsonDocument doc = JsonDocument.Parse(json);
             return ExtractImageUrl(doc.RootElement);
+        }
+
+        /// <summary>
+        /// Performs a throttled HTTP GET, returning the full response.
+        /// Acquires the rate-limiter permit and schedules its release after
+        /// <see cref="RateLimitWindow"/> so that requests are spaced ≥ 500ms apart.
+        /// </summary>
+        private async Task<HttpResponseMessage> ThrottledGetAsync(string url)
+        {
+            await _httpRateLimiter.WaitAsync();
+            ScheduleRateLimiterRelease();
+            return await _httpClient.GetAsync(url);
+        }
+
+        /// <summary>
+        /// Performs a throttled HTTP GET, returning the response body as bytes.
+        /// </summary>
+        private async Task<byte[]> ThrottledGetBytesAsync(string url)
+        {
+            await _httpRateLimiter.WaitAsync();
+            ScheduleRateLimiterRelease();
+            return await _httpClient.GetByteArrayAsync(url);
+        }
+
+        /// <summary>
+        /// Releases the rate-limiter permit after <see cref="RateLimitWindow"/> has elapsed.
+        /// The release is measured from the moment the permit was acquired (not from when
+        /// the HTTP request finishes), which correctly enforces ≤ 2 requests/second.
+        /// </summary>
+        private void ScheduleRateLimiterRelease()
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(RateLimitWindow);
+                _httpRateLimiter.Release();
+            });
         }
 
         /// <summary>
@@ -175,11 +201,6 @@ namespace CardChooser.Services
         {
             if (!Directory.Exists(path))
                 Directory.CreateDirectory(path);
-        }
-
-        public void Dispose()
-        {
-            _httpClient.Dispose();
         }
     }
 }
