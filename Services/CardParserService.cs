@@ -12,12 +12,15 @@ namespace CardChooser.Services
             if (string.IsNullOrWhiteSpace(line))
                 return string.Empty;
 
-            // Remove leading quantity (e.g., "1 ", "2 ", etc.)
+            // Remove leading quantity (e.g., "1 ", "2 ", etc.) only if the first token is a number
             int firstSpaceIndex = line.IndexOf(' ');
             if (firstSpaceIndex == -1)
                 return line; // No space found, return the whole line
 
-            string withoutQuantity = line.Substring(firstSpaceIndex + 1).Trim();
+            string firstToken = line.Substring(0, firstSpaceIndex);
+            string withoutQuantity = int.TryParse(firstToken, out _)
+                ? line.Substring(firstSpaceIndex + 1).Trim()
+                : line.Trim();
 
             // Find the first opening parenthesis to remove set code and card number
             int parenthesisIndex = withoutQuantity.IndexOf('(');
