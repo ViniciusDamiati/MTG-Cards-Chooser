@@ -297,10 +297,35 @@ namespace CardChooser.Services
         // ────────────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Returns <c>true</c> when <see cref="AiSrToolPath"/> points to an existing executable.
+        /// Resolves <see cref="AiSrToolPath"/> to a full absolute path by looking next to the
+        /// running application (<see cref="AppContext.BaseDirectory"/>). This ensures the tool is
+        /// found regardless of the process working directory.
+        /// Returns an empty string when the file cannot be located.
+        /// </summary>
+        private static string GetAiSrToolFullPath()
+        {
+            if (string.IsNullOrWhiteSpace(AiSrToolPath)) return string.Empty;
+
+            // If the constant is already absolute, use it directly.
+            if (Path.IsPathRooted(AiSrToolPath))
+                return File.Exists(AiSrToolPath) ? AiSrToolPath : string.Empty;
+
+            // Resolve relative path from the application's base directory
+            // (works whether the app is run via `dotnet run` or as a published exe).
+            string appBasePath = Path.Combine(AppContext.BaseDirectory, AiSrToolPath);
+            if (File.Exists(appBasePath)) return appBasePath;
+
+            // Fallback: try the current working directory
+            if (File.Exists(AiSrToolPath)) return Path.GetFullPath(AiSrToolPath);
+
+            return string.Empty;
+        }
+
+        /// <summary>
+        /// Returns <c>true</c> when <see cref="AiSrToolPath"/> can be resolved to an existing executable.
         /// </summary>
         private static bool IsAiSrToolAvailable() =>
-            !string.IsNullOrWhiteSpace(AiSrToolPath) && File.Exists(AiSrToolPath);
+            !string.IsNullOrWhiteSpace(GetAiSrToolFullPath());
 
         /// <summary>
         /// Calls <c>realesrgan-ncnn-vulkan.exe</c> to upscale <paramref name="inputPath"/> by
@@ -308,25 +333,28 @@ namespace CardChooser.Services
         /// Returns <c>true</c> on success.
         /// </summary>
         /// <remarks>
-        /// The tool can be downloaded from: https://github.com/xinntao/Real-ESRGAN/releases
-        /// Recommended models for card art:
-        ///   • <c>realesr-animevideov3</c>  — painted/anime-style illustration (default)
-        ///   • <c>realesrgan-x4plus</c>     — photo-realistic images
-        /// Place <c>realesrgan-ncnn-vulkan.exe</c> and its <c>models/</c> folder next to
-        /// <c>CardChooser.exe</c> (or update <see cref="AiSrToolPath"/>).
+        /// The tool is located via <see cref="GetAiSrToolFullPath"/> — it is copied to the build
+        /// output directory by the project file, so it always lives next to <c>CardChooser.exe</c>.
         /// </remarks>
         private static async Task<bool> RunSuperResolutionAsync(string inputPath, string outputPath)
         {
+            string toolPath = GetAiSrToolFullPath();
+            if (string.IsNullOrWhiteSpace(toolPath)) return false;
+
+            // Resolve models folder relative to the same directory as the tool
+            string toolDir      = Path.GetDirectoryName(toolPath) ?? AppContext.BaseDirectory;
+            string modelsAbsPath = Path.Combine(toolDir, AiSrModelsFolder);
+
             try
             {
                 using var process = new Process
                 {
                     StartInfo = new ProcessStartInfo
                     {
-                        FileName  = AiSrToolPath,
-                    Arguments = $"-i \"{inputPath}\" -o \"{outputPath}\" " +
+                        FileName  = toolPath,
+                        Arguments = $"-i \"{inputPath}\" -o \"{outputPath}\" " +
                                     $"-n {AiSrModelName} -s {AiSrScale} -f jpg " +
-                                    $"-m \"{AiSrModelsFolder}\"",
+                                    $"-m \"{modelsAbsPath}\"",
                         UseShellExecute        = false,
                         RedirectStandardOutput = true,
                         RedirectStandardError  = true,
