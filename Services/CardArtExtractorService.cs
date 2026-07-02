@@ -42,10 +42,15 @@ namespace CardChooser.Services
         //
         // These values crop exactly to the printed art frame — no name bar, no type bar.
         // Adjust only if a different Scryfall image style produces a misaligned crop.
-        private const double ArtFrameLeft   = 0.077;   //  7.7 % →  231 px left edge
-        private const double ArtFrameTop    = 0.135;   // 13.5 % →  562 px top edge (below name bar)
-        private const double ArtFrameWidth  = 0.846;   // 84.6 % → 2538 px wide
-        private const double ArtFrameHeight = 0.395;   // 39.5 % → 1643 px tall  (bottom @ 53.0 %)
+        private const double ArtFrameLeft   = 0.077;   //  7.7  % →  231 px left edge
+        private const double ArtFrameTop    = 0.135;   // 13.5  % →  562 px top edge (below name bar)
+        private const double ArtFrameWidth  = 0.8425;  // 84.25 % → 2527 px wide   ← verified in Photoshop
+        private const double ArtFrameHeight = 0.4394;  // 43.94 % → 1827 px tall   ← verified in Photoshop
+
+        // Expected output dimensions after crop (verified against Photoshop Image Size dialog
+        // at 1200 DPI → 2.106" × 1.523", matching the printed M15 art frame).
+        private const int ExpectedArtWidth  = 2527;
+        private const int ExpectedArtHeight = 1827;
 
         // ── Enhancement — denoise ────────────────────────────────────────────
         // Gaussian sigma used for JPEG-artefact reduction before sharpening.
@@ -222,6 +227,15 @@ namespace CardChooser.Services
 
             // 3. Crop to M15 art frame
             using SKBitmap artBitmap = ExtractCrop(resized, cropRect);
+
+            // ── Verification: confirm crop dimensions before enhancement ─────
+            // Expected: 2527 × 1827 px @ 1200 DPI (≈ 2.106" × 1.523", verified in Photoshop).
+            // A mismatch means the crop constants need recalibration for this source image format.
+            bool cropOk = artBitmap.Width == ExpectedArtWidth && artBitmap.Height == ExpectedArtHeight;
+            string sizeLabel = cropOk
+                ? $"{artBitmap.Width} × {artBitmap.Height} px ✓"
+                : $"{artBitmap.Width} × {artBitmap.Height} px  ⚠ expected {ExpectedArtWidth} × {ExpectedArtHeight}";
+            Console.WriteLine($"    crop size : {sizeLabel}");
 
             // 4. Denoise — gentle Gaussian blur to suppress JPEG compression artefacts
             using SKBitmap denoised = ApplyBlur(artBitmap, DenoiseSigma);
@@ -423,8 +437,8 @@ namespace CardChooser.Services
         {
             int x      = (int)(TargetCardWidth  * ArtFrameLeft);    //  231 px
             int y      = (int)(TargetCardHeight * ArtFrameTop);     //  562 px
-            int width  = (int)(TargetCardWidth  * ArtFrameWidth);   // 2538 px
-            int height = (int)(TargetCardHeight * ArtFrameHeight);  // 1643 px  (bottom @ 2205 px = 53.0 %)
+            int width  = (int)(TargetCardWidth  * ArtFrameWidth);   // 2527 px
+            int height = (int)(TargetCardHeight * ArtFrameHeight);  // 1827 px
             return new SKRectI(x, y, x + width, y + height);
         }
 
