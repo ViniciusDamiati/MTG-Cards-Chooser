@@ -268,10 +268,19 @@ namespace CardChooser.Services
             using var gpuResized = new NPPImage_8uC3(targetW, targetH);
             gpuSrc.Resize(gpuResized, InterpolationMode.Cubic, _streamCtx);
 
-            // ── 4. Crop on GPU: Copy(dst, srcOffsetX, srcOffsetY) ────────────
-            //    Copies cropW×cropH pixels starting at (cropX, cropY) in gpuResized.
+            // ── 4. Crop on GPU via SetRoi ─────────────────────────────────────
+            //    NPPImage_8uC3.Copy(dst, xOffset, yOffset) does NOT exist — that
+            //    overload resolves to the channel-extraction Copy(C1 dst, channelSrc)
+            //    and throws ArgumentOutOfRangeException when cropX > 2.
+            //
+            //    Correct idiom: restrict the source image to the desired rectangle
+            //    with SetRoi, then call the plain Copy(dst) which copies exactly
+            //    the ROI region into the (correctly sized) destination.
             using var gpuCropped = new NPPImage_8uC3(cropW, cropH);
-            gpuResized.Copy(gpuCropped, cropX, cropY);
+            gpuResized.SetRoi(cropX, cropY, cropW, cropH);
+            gpuResized.Copy(gpuCropped);
+            // Reset so subsequent ROI checks on gpuResized see the full image.
+            gpuResized.SetRoi(0, 0, targetW, targetH);
 
             // ── 5. Gaussian denoise on GPU (3×3, Reflect boundary) ────────────
             using var gpuBlurred = new NPPImage_8uC3(cropW, cropH);

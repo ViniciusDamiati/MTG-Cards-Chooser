@@ -431,10 +431,18 @@ private SKBitmap RunGpuPipeline(
     using var gpuResized = new NPPImage_8uC3(targetW, targetH);
     gpuSrc.Resize(gpuResized, InterpolationMode.Cubic, streamCtx);
 
-    // ── Step 4: Crop ROI on GPU ──────────────────────────────────────────
-    // Copy(dst, srcOffsetX, srcOffsetY) copies dst.Size from src at the offset
+    // ── Step 4: Crop ROI on GPU via SetRoi ───────────────────────────────
+    // ⚠ Do NOT use Copy(dst, x, y) — that overload resolves to the
+    //   channel-extraction Copy(NPPImage_8uC1 dst, int channelSrc) and
+    //   throws ArgumentOutOfRangeException when x > 2.
+    //
+    // Correct idiom: set the ROI on the source to the desired sub-rectangle,
+    // then call the plain Copy(dst).  DevPtrRoi is automatically adjusted so
+    // only the ROI pixels are copied into the (correctly sized) destination.
     using var gpuCropped = new NPPImage_8uC3(cropW, cropH);
-    gpuResized.Copy(gpuCropped, cropX, cropY);
+    gpuResized.SetRoi(cropX, cropY, cropW, cropH);
+    gpuResized.Copy(gpuCropped);
+    gpuResized.SetRoi(0, 0, targetW, targetH); // restore full-image ROI
 
     // ── Step 5: Gaussian denoise on GPU (3×3, border replication) ────────
     using var gpuBlurred = new NPPImage_8uC3(cropW, cropH);
@@ -1073,13 +1081,20 @@ using var dst = new NPPImage_8uC3(newWidth, newHeight);
 src.Resize(dst, InterpolationMode.Cubic, streamCtx);
 ```
 
-### Crop (Copy ROI)
+### Crop (Copy ROI via SetRoi)
+
+> ⚠ **Do NOT** use `src.Copy(dst, cropX, cropY)` — that overload resolves to the
+> channel-extraction signature `Copy(NPPImage_8uC1 dst, int channelSrc)` and throws
+> `ArgumentOutOfRangeException` when `cropX > 2`.
 
 ```csharp
-// dst size determines how much is copied
-// (cropX, cropY) is the offset in src
+// Correct idiom: narrow the source to the desired sub-rectangle with SetRoi,
+// then call the plain Copy(dst).  DevPtrRoi is adjusted automatically so only
+// the ROI pixels are transferred to the (correctly-sized) destination.
 using var dst = new NPPImage_8uC3(cropWidth, cropHeight);
-src.Copy(dst, cropX, cropY);
+src.SetRoi(cropX, cropY, cropWidth, cropHeight);
+src.Copy(dst);
+src.SetRoi(0, 0, src.Width, src.Height); // restore full-image ROI
 ```
 
 ### Gaussian Blur
