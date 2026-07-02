@@ -28,21 +28,9 @@ namespace CardChooser.Services
             "nppif64_13",    // image filtering           (FilterGaussBorder, FilterBorder)
         };
 
-        // Well-known CUDA Toolkit installation paths on Windows, newest first.
-        // Checked only when the DLLs are not already resolvable via PATH / system dirs.
-        private static readonly string[] CudaBinSearchPaths =
-            Enumerable.Range(0, 8)                       // v13.0 … v12.0 (minor revisions ignored)
-                .SelectMany(i => new[]
-                {
-                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.0\bin",
-                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.6\bin",
-                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.5\bin",
-                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.4\bin",
-                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.3\bin",
-                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.2\bin",
-                    $@"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v{13 - i}.1\bin",
-                })
-                .ToArray();
+        // Standard root of CUDA Toolkit installs on Windows.
+        private const string CudaToolkitRoot =
+            @"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA";
 
         private readonly PrimaryContext _ctx;
         private readonly NppStreamContext _streamCtx;
@@ -82,7 +70,14 @@ namespace CardChooser.Services
                 //   b) If any DLL is missing via PATH, scan well-known CUDA Toolkit install
                 //      directories (the installer often skips adding them to PATH).
                 //      Load each DLL from its full absolute path so the CLR can find it.
-                if (!EnsureNppDllsLoaded(out string nppSource)) return null;
+                if (!EnsureNppDllsLoaded(out string nppSource))
+                {
+                    // Print the diagnostic here so the caller sees WHY CUDA is unavailable.
+                    // This appears slightly before the "GPU image processing: OFF" line in
+                    // ExtractArtsAsync but is far more informative than a silent fallback.
+                    Console.WriteLine($"    CUDA NPP : {nppSource}");
+                    return null;
+                }
                 Console.WriteLine($"    CUDA NPP DLLs : loaded from {nppSource}");
 
                 // ── Step 2: check that a CUDA device is present ───────────────────────
@@ -139,20 +134,29 @@ namespace CardChooser.Services
         private static bool EnsureNppDllsLoaded(out string source)
         {
             // ── Pass 1: PATH / system-directory search ────────────────────────
+            // Works when the CUDA Toolkit bin\ directory is in PATH.
             if (RequiredNppDlls.All(dll => NativeLibrary.TryLoad(dll, out _)))
             {
                 source = "PATH";
                 return true;
             }
 
-            // ── Pass 2: well-known CUDA Toolkit install directories ────────────
-            // The CUDA Toolkit installer often does NOT add its bin\ folder to PATH,
-            // so NativeLibrary.TryLoad by name fails even when the DLLs exist on disk.
-            // Loading by full absolute path bypasses the PATH requirement.
-            foreach (string dir in CudaBinSearchPaths)
+            // ── Pass 2: dynamic scan of installed CUDA Toolkit versions ───────
+            // The CUDA Toolkit installer often does NOT add its bin\ to PATH.
+            // We scan every installed version under the standard install root,
+            // ordered newest-first (highest version number wins).
+            IEnumerable<string> binDirs = Enumerable.Empty<string>();
+            if (Directory.Exists(CudaToolkitRoot))
             {
-                if (!Directory.Exists(dir)) continue;
+                binDirs = Directory
+                    .GetDirectories(CudaToolkitRoot, "v*", SearchOption.TopDirectoryOnly)
+                    .OrderByDescending(d => d)           // v12.6 > v12.3 > v12.0, etc.
+                    .Select(d => Path.Combine(d, "bin"))
+                    .Where(Directory.Exists);
+            }
 
+            foreach (string dir in binDirs)
+            {
                 bool allFound = RequiredNppDlls.All(dll =>
                 {
                     string fullPath = Path.Combine(dir, dll + ".dll");
@@ -166,20 +170,33 @@ namespace CardChooser.Services
                 }
             }
 
-            // ── Not found — build a diagnostic message ─────────────────────────
-            string missing = string.Join(", ",
-                RequiredNppDlls.Where(dll =>
-                {
-                    bool inPath = NativeLibrary.TryLoad(dll, out _);
-                    bool inDirs = CudaBinSearchPaths
-                        .Any(d => File.Exists(Path.Combine(d, dll + ".dll")));
-                    return !inPath && !inDirs;
-                })
-                .Select(dll => dll + ".dll"));
+            // ── Not found — build an actionable diagnostic ────────────────────
+            // Tell the user exactly which DLL is missing and where we looked.
+            bool rootExists = Directory.Exists(CudaToolkitRoot);
+            var missingDlls = RequiredNppDlls
+                .Where(dll => !NativeLibrary.TryLoad(dll, out _))
+                .Select(dll => dll + ".dll")
+                .ToList();
 
-            source = string.IsNullOrEmpty(missing)
-                ? "DLLs found on disk but could not be loaded (check architecture / corruption)"
-                : $"missing: {missing} — install CUDA Toolkit 12.x from https://developer.nvidia.com/cuda-downloads";
+            if (!rootExists)
+            {
+                source = $"CUDA Toolkit not found at '{CudaToolkitRoot}'. " +
+                         $"Install from https://developer.nvidia.com/cuda-downloads " +
+                         $"(requires Toolkit 12.2+ for NPP API v13 DLLs)";
+            }
+            else if (missingDlls.Count > 0)
+            {
+                string versions = string.Join(", ",
+                    Directory.GetDirectories(CudaToolkitRoot, "v*")
+                             .Select(Path.GetFileName));
+                source = $"Found CUDA installs [{versions}] but none contain " +
+                         $"{string.Join(", ", missingDlls)}. " +
+                         $"Upgrade to CUDA Toolkit 12.2+ (NPP API 13).";
+            }
+            else
+            {
+                source = "DLLs found but could not be loaded — check DLL architecture or corruption.";
+            }
 
             return false;
         }
