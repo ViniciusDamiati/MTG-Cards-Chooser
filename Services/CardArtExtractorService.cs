@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Threading.Channels;
 using SkiaSharp;
 using CardChooser.Services.Interfaces;
 
@@ -8,96 +9,103 @@ namespace CardChooser.Services
     /// Extracts and enhances card art from Scryfall card images using SkiaSharp (Google Skia engine).
     ///
     /// Pipeline per image:
-    ///   1. [Optional] AI Super-Resolution — if <c>realesrgan-ncnn-vulkan.exe</c> is present at
-    ///      <see cref="AiSrToolPath"/>, upscale the original Scryfall JPEG 4× before any other
-    ///      processing (672×936 → 2688×3744). Produces far sharper detail than bicubic upscaling.
-    ///   2. Resize to 3000 × 4159 px using Catmull-Rom cubic resampling, matching the Proxyshop
-    ///      PSD template canvas (equivalent to Photoshop "Preserve Details" enlargement).
-    ///   3. Crop to the standard M15 art frame, discarding border, name bar, text box, etc.
-    ///   4. Denoise — gentle Gaussian blur (σ = 0.5) to suppress JPEG compression artefacts
-    ///      without softening edges.
-    ///   5. Sharpen — 3×3 Laplacian unsharp-mask kernel to recover fine edge detail.
-    ///   6. Encode as JPEG (quality 95) and patch the JFIF header to embed 1200 DPI.
-    ///   7. Save to <c>scryfall_images/cards_arts/</c>.
+    ///   1. [Optional] AI Super-Resolution — if <c>realesrgan-ncnn-vulkan.exe</c> is present,
+    ///      upscale 4× on the GPU using Vulkan compute (CUDA cores on RTX 3080; explicit GPU
+    ///      selection, auto tile-size to maximise 10 GB VRAM, 4 GPU threads).
+    ///   2. Resize to 3000 × 4159 px using Catmull-Rom cubic resampling.
+    ///   3. Crop to the standard M15 art frame (2527 × 1827 px @ 1200 DPI, verified).
+    ///   4. Denoise — Gaussian blur (σ = 0.5) to suppress JPEG artefacts.
+    ///   5. Sharpen — 3×3 Laplacian unsharp-mask.
+    ///   6. Encode as JPEG (quality 95) with 1200 DPI JFIF header.
     ///
-    /// All constants (crop percentages, blur sigma, kernel, quality) are defined at the top of
-    /// this class and can be tuned without touching any other file.
+    /// Concurrency strategy:
+    ///   • AI SR ON  → <b>GPU + CPU pipeline</b>: a bounded <see cref="Channel{T}"/> overlaps GPU
+    ///     work (AI SR, one image at a time) with CPU work (resize→crop→denoise→sharpen→save),
+    ///     so GPU and CPU are never both idle at the same time.
+    ///   • AI SR OFF → <b>CPU parallel</b>: <see cref="Parallel.ForEachAsync"/> distributes all
+    ///     images across <see cref="CpuParallelism"/> cores simultaneously.
     /// </summary>
     public class CardArtExtractorService : ICardArtExtractorService
     {
-        // ── Target canvas (matches Proxyshop PSD template dimensions) ──────────
-        private const int TargetCardWidth = 3000;
+        // ── Target canvas (Proxyshop PSD template) ───────────────────────────
+        private const int TargetCardWidth  = 3000;
         private const int TargetCardHeight = 4159;
-        private const int TargetDpi = 1200;
+        private const int TargetDpi        = 1200;
 
-        // ── Art frame position (fractions of the full resized card image) ─────
-        // Calibrated for standard M15 cards from Scryfall 'large' JPEGs (672 × 936 px source).
-        //
-        // M15 art-frame boundaries (measured on 672×936 Scryfall source, then scaled):
-        //   name bar bottom ≈ 126 px → 13.5 % of 936  →  ArtFrameTop must be ≥ 0.135
-        //   art top         ≈ 126 px → 13.5 % of 936  →  ArtFrameTop   = 0.135
-        //   art bottom      ≈ 496 px → 53.0 % of 936  →  bottom edge @ 0.135 + 0.395 = 0.530
-        //   art left        ≈  52 px →  7.7 % of 672  →  ArtFrameLeft  = 0.077
-        //   art right       ≈ 620 px → 92.3 % of 672  →  width         = 0.846
-        //
-        // These values crop exactly to the printed art frame — no name bar, no type bar.
-        // Adjust only if a different Scryfall image style produces a misaligned crop.
-        private const double ArtFrameLeft   = 0.077;   //  7.7  % →  231 px left edge
-        private const double ArtFrameTop    = 0.135;   // 13.5  % →  562 px top edge (below name bar)
-        private const double ArtFrameWidth  = 0.8425;  // 84.25 % → 2527 px wide   ← verified in Photoshop
-        private const double ArtFrameHeight = 0.4394;  // 43.94 % → 1827 px tall   ← verified in Photoshop
+        // ── Art frame crop ────────────────────────────────────────────────────
+        // Calibrated against Photoshop Image Size dialog (2527 × 1827 px @ 1200 DPI = 2.106" × 1.523").
+        // Boundaries measured on a 672×936 Scryfall 'large' JPEG source.
+        private const double ArtFrameLeft   = 0.077;   //  7.70 % →  231 px (left edge of art)
+        private const double ArtFrameTop    = 0.135;   // 13.50 % →  562 px (below name bar)
+        private const double ArtFrameWidth  = 0.8425;  // 84.25 % → 2527 px ← Photoshop verified
+        private const double ArtFrameHeight = 0.4394;  // 43.94 % → 1827 px ← Photoshop verified
 
-        // Expected output dimensions after crop (verified against Photoshop Image Size dialog
-        // at 1200 DPI → 2.106" × 1.523", matching the printed M15 art frame).
+        // Expected dimensions — printed before enhancement as a sanity check.
         private const int ExpectedArtWidth  = 2527;
         private const int ExpectedArtHeight = 1827;
 
-        // ── Enhancement — denoise ────────────────────────────────────────────
-        // Gaussian sigma used for JPEG-artefact reduction before sharpening.
-        // Lower = less blurring (preserve more detail); higher = more noise removal.
+        // ── Enhancement ──────────────────────────────────────────────────────
+        // Gaussian sigma for JPEG-artefact reduction (0.5 = gentle, preserves detail).
         private const float DenoiseSigma = 0.5f;
 
-        // ── Enhancement — sharpening kernel ─────────────────────────────────
-        // 3×3 eight-connected Laplacian with sum = 1 (brightness-preserving).
-        // Increase magnitude of negative weights for stronger sharpening.
+        // 3×3 Laplacian unsharp-mask kernel (sum = 1, brightness-preserving).
         private static readonly float[] SharpenKernel =
         {
             -0.25f, -0.5f, -0.25f,
             -0.5f,   4.0f, -0.5f,
             -0.25f, -0.5f, -0.25f
         };
-        // sum = 4 + 4*(-0.5) + 4*(-0.25) = 4 - 2 - 1 = 1  ✓
 
-        // ── JPEG output quality ──────────────────────────────────────────────
         private const int JpegQuality = 95;
 
-        // ── AI Super-Resolution (optional) ───────────────────────────────────
-        // Path to the realesrgan-ncnn-vulkan executable.
-        // The exe, vcomp140.dll, vcomp140d.dll, and the models folder are expected
-        // in the project root (next to CardChooser.exe when running via dotnet run).
-        // Set to an empty string to disable AI super-resolution entirely.
-        private const string AiSrToolPath = "realesrgan-ncnn-vulkan.exe";
-
-        // Folder containing the .bin/.param model weight files (relative to CWD).
-        // Maps to d:\Projects\MTG\MTG-Cards-Chooser\realesrgan-models\
+        // ── AI Super-Resolution (realesrgan-ncnn-vulkan) ─────────────────────
+        // Set to empty string to disable AI SR entirely.
+        private const string AiSrToolPath    = "realesrgan-ncnn-vulkan.exe";
         private const string AiSrModelsFolder = "realesrgan-models";
 
-        // Model name (without scale suffix or extension).
-        // Available models in realesrgan-models/:
-        //   realesr-animevideov3       — fast, painted/anime art  (1.2 MB, default)
-        //   realesrgan-x4plus-anime    — higher quality illustration (8.9 MB)
-        //   realesrgan-x4plus          — photo-realistic images  (33 MB)
+        // Model selection — change to any model in realesrgan-models/:
+        //   realesr-animevideov3   — fast, painted/anime art  (1.2 MB, default)
+        //   realesrgan-x4plus-anime — higher quality illustration (8.9 MB)
+        //   realesrgan-x4plus      — photo-realistic images  (33 MB)
         private const string AiSrModelName = "realesr-animevideov3";
-        private const int AiSrScale = 4;
+        private const int    AiSrScale     = 4;
 
-        // ── JFIF DPI header offsets ──────────────────────────────────────────
-        private const int JfifUnitsOffset = 13;
+        // ── GPU optimisation flags ────────────────────────────────────────────
+        // -g  GPU index  →  0 = first GPU (RTX 3080). Use -1 for auto-detect.
+        // -t  tile size  →  0 = auto, uses as much VRAM as available.
+        //                   RTX 3080 has 10 GB VRAM → very large tiles → fewer GPU passes.
+        // -j  threads    →  load:proc:save — 4 GPU compute threads for RTX 3080.
+        private const int    AiSrGpuId        = 0;
+        private const int    AiSrTileSize     = 0;       // 0 = auto
+        private const string AiSrThreadConfig = "1:4:1"; // 4 GPU compute threads
+
+        // ── Concurrency ───────────────────────────────────────────────────────
+        // Channel capacity = 2: GPU can be 2 images ahead of the CPU consumer,
+        // ensuring the GPU is never stalled waiting for the CPU to catch up.
+        private const int SrChannelCapacity = 2;
+
+        // CPU-only parallelism: half the logical cores avoids thermal/memory pressure.
+        private static readonly int CpuParallelism = Math.Max(1, Environment.ProcessorCount / 2);
+
+        // ── JFIF DPI header offsets ───────────────────────────────────────────
+        private const int JfifUnitsOffset    = 13;
         private const int JfifXDensityOffset = 14;
         private const int JfifYDensityOffset = 16;
-        private const int JfifMinLength = 18;
+        private const int JfifMinLength      = 18;
 
-        // ── File handling ────────────────────────────────────────────────────
         private const string JpegExtension = ".jpg";
+
+        // ── Pipeline token (carries GPU SR result to CPU consumer) ───────────
+        private sealed record SrResult(
+            string SourcePath,
+            string InputForProcessing, // temp upscaled path, or original if SR failed
+            string CardFileName,
+            bool   WasUpscaled,
+            string StatusPrefix);
+
+        // ════════════════════════════════════════════════════════════════════
+        // Public API
+        // ════════════════════════════════════════════════════════════════════
 
         /// <inheritdoc />
         public async Task ExtractArtsAsync(string sourceImagesFolder, string artOutputFolder)
@@ -109,7 +117,6 @@ namespace CardChooser.Services
             }
 
             EnsureDirectoryExists(artOutputFolder);
-
             IReadOnlyList<string> imageFiles = DiscoverJpegs(sourceImagesFolder);
 
             if (imageFiles.Count == 0)
@@ -120,21 +127,28 @@ namespace CardChooser.Services
 
             bool aiSrAvailable = IsAiSrToolAvailable();
             Console.WriteLine($"Extracting card art from {imageFiles.Count} image(s)...");
-            Console.WriteLine($"  AI super-resolution : {(aiSrAvailable ? $"ON  ({AiSrToolPath})" : "OFF (realesrgan-ncnn-vulkan.exe not found)")}");
+            Console.WriteLine($"  AI super-resolution : {(aiSrAvailable
+                ? $"ON  — GPU {AiSrGpuId}, model={AiSrModelName}, tile=auto (10 GB VRAM), threads={AiSrThreadConfig}"
+                : "OFF (realesrgan-ncnn-vulkan.exe not found)")}");
             Console.WriteLine($"  Denoise + sharpen   : ON (always)");
+            Console.WriteLine($"  Concurrency         : {(aiSrAvailable
+                ? $"GPU+CPU pipeline (channel depth {SrChannelCapacity})"
+                : $"CPU parallel ({CpuParallelism} cores, Parallel.ForEachAsync)")}");
             Console.WriteLine($"  Output folder       : {artOutputFolder}");
             Console.WriteLine();
 
             SKRectI cropRect = ComputeArtCropRectangle();
+            int successCount, failureCount;
 
-            int successCount = 0;
-            int failureCount = 0;
-
-            foreach (string imageFile in imageFiles)
+            if (aiSrAvailable)
             {
-                bool succeeded = await TryExtractArtAsync(imageFile, artOutputFolder, cropRect, aiSrAvailable);
-                if (succeeded) successCount++;
-                else           failureCount++;
+                (successCount, failureCount) =
+                    await RunPipelineWithSrAsync(imageFiles, artOutputFolder, cropRect);
+            }
+            else
+            {
+                (successCount, failureCount) =
+                    await RunParallelCpuAsync(imageFiles, artOutputFolder, cropRect);
             }
 
             Console.WriteLine();
@@ -142,77 +156,140 @@ namespace CardChooser.Services
             Console.WriteLine();
         }
 
-        // ────────────────────────────────────────────────────────────────────
-        // Per-image pipeline
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
+        // Concurrency strategies
+        // ════════════════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Processes one card image through the full pipeline and writes the result.
-        /// If the AI SR tool is available, it is applied to the original small JPEG
-        /// before the main resize, giving far better upscaling quality.
+        /// GPU + CPU pipeline using a bounded <see cref="Channel{T}"/>.
+        /// <para>
+        /// A producer <see cref="Task"/> runs AI SR sequentially on GPU 0 (one image at a time)
+        /// and writes <see cref="SrResult"/> tokens to the channel.  The consumer (this method's
+        /// <c>await foreach</c>) reads tokens and runs the CPU pipeline concurrently, so GPU and
+        /// CPU are busy at the same time:
+        /// </para>
+        /// <code>
+        ///   GPU:  [SR card-1]──[SR card-2]──[SR card-3]──[SR card-4]──
+        ///   CPU:              [CPU card-1]──[CPU card-2]──[CPU card-3]──[CPU card-4]
+        /// </code>
         /// </summary>
-        private static async Task<bool> TryExtractArtAsync(
-            string sourceImagePath,
+        private static async Task<(int successes, int failures)> RunPipelineWithSrAsync(
+            IReadOnlyList<string> imageFiles,
             string artOutputFolder,
-            SKRectI cropRect,
-            bool aiSrAvailable)
+            SKRectI cropRect)
         {
-            string cardFileName = Path.GetFileName(sourceImagePath);
-            string? tempSrPath = null;
+            var channel = Channel.CreateBounded<SrResult>(new BoundedChannelOptions(SrChannelCapacity)
+            {
+                FullMode     = BoundedChannelFullMode.Wait,
+                SingleReader = true,
+                SingleWriter = true
+            });
 
+            // ── GPU producer — runs AI SR, one image at a time ────────────────
+            var producer = Task.Run(async () =>
+            {
+                foreach (string imageFile in imageFiles)
+                {
+                    string cardFileName = Path.GetFileName(imageFile);
+                    string tempPath     = Path.Combine(Path.GetTempPath(),
+                                             $"sr_{Guid.NewGuid():N}_{cardFileName}");
+
+                    bool   ok     = await RunSuperResolutionAsync(imageFile, tempPath);
+                    string label  = ok ? "[SR ✓]" : "[SR FAILED — Catmull-Rom fallback]";
+
+                    await channel.Writer.WriteAsync(new SrResult(
+                        SourcePath:         imageFile,
+                        InputForProcessing: ok ? tempPath : imageFile,
+                        CardFileName:       cardFileName,
+                        WasUpscaled:        ok,
+                        StatusPrefix:       $"  '{cardFileName}' {label}"));
+                }
+                channel.Writer.Complete();
+            });
+
+            // ── CPU consumer — processes each SR result as it arrives ─────────
+            int successes = 0, failures = 0;
+
+            await foreach (SrResult result in channel.Reader.ReadAllAsync())
+            {
+                bool ok = await TryCpuProcessAsync(result, artOutputFolder, cropRect);
+                if (ok) successes++;
+                else    failures++;
+
+                if (result.WasUpscaled && File.Exists(result.InputForProcessing))
+                    File.Delete(result.InputForProcessing);
+            }
+
+            await producer; // re-throw any unhandled producer exception
+            return (successes, failures);
+        }
+
+        /// <summary>
+        /// CPU-only path (no AI SR): all images are processed in parallel across
+        /// <see cref="CpuParallelism"/> cores using <see cref="Parallel.ForEachAsync"/>.
+        /// </summary>
+        private static async Task<(int successes, int failures)> RunParallelCpuAsync(
+            IReadOnlyList<string> imageFiles,
+            string artOutputFolder,
+            SKRectI cropRect)
+        {
+            int successes = 0, failures = 0;
+
+            await Parallel.ForEachAsync(
+                imageFiles,
+                new ParallelOptions { MaxDegreeOfParallelism = CpuParallelism },
+                async (imageFile, _) =>
+                {
+                    string cardFileName = Path.GetFileName(imageFile);
+                    var result = new SrResult(imageFile, imageFile, cardFileName,
+                                              WasUpscaled: false,
+                                              StatusPrefix: $"  '{cardFileName}'");
+
+                    bool ok = await TryCpuProcessAsync(result, artOutputFolder, cropRect);
+                    if (ok) Interlocked.Increment(ref successes);
+                    else    Interlocked.Increment(ref failures);
+                });
+
+            return (successes, failures);
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // Per-image CPU pipeline
+        // ════════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Runs the synchronous image pipeline on the thread pool and writes the output file.
+        /// </summary>
+        private static async Task<bool> TryCpuProcessAsync(
+            SrResult result,
+            string artOutputFolder,
+            SKRectI cropRect)
+        {
             try
             {
-                string inputPath = sourceImagePath;
+                // Offload CPU-intensive work to the thread pool
+                byte[] jpegBytes = await Task.Run(() =>
+                    ProcessCardImageToBytes(result.InputForProcessing, cropRect));
 
-                // ── Step 1 (optional): AI super-resolution ───────────────────
-                if (aiSrAvailable)
-                {
-                    tempSrPath = Path.Combine(Path.GetTempPath(), $"sr_{Guid.NewGuid():N}_{cardFileName}");
-                    bool srOk = await RunSuperResolutionAsync(sourceImagePath, tempSrPath);
-                    if (srOk)
-                    {
-                        inputPath = tempSrPath;
-                        Console.Write($"  '{cardFileName}' [SR OK]");
-                    }
-                    else
-                    {
-                        Console.Write($"  '{cardFileName}' [SR FAILED — using Catmull-Rom]");
-                    }
-                }
-
-                // ── Steps 2-5: Resize → Crop → Denoise → Sharpen ────────────
-                byte[] jpegBytes = await Task.Run(() => ProcessCardImageToBytes(inputPath, cropRect));
-
-                // ── Step 6: Patch JFIF header to embed 1200 DPI ──────────────
                 SetJfifDpi(jpegBytes, TargetDpi);
 
-                // ── Step 7: Write art file ───────────────────────────────────
-                string outputPath = Path.Combine(artOutputFolder, cardFileName);
+                string outputPath = Path.Combine(artOutputFolder, result.CardFileName);
                 await File.WriteAllBytesAsync(outputPath, jpegBytes);
 
-                if (!aiSrAvailable) Console.Write($"  '{cardFileName}'");
-                Console.WriteLine(" ... OK");
+                Console.WriteLine($"{result.StatusPrefix} ... OK");
                 return true;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"  '{cardFileName}' ... FAILED ({ex.Message})");
+                Console.WriteLine($"{result.StatusPrefix} ... FAILED ({ex.Message})");
                 return false;
-            }
-            finally
-            {
-                if (tempSrPath is not null && File.Exists(tempSrPath))
-                    File.Delete(tempSrPath);
             }
         }
 
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
         // Image processing (synchronous, runs on thread pool via Task.Run)
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Core synchronous image pipeline: load → resize → crop → denoise → sharpen → encode.
-        /// </summary>
         private static byte[] ProcessCardImageToBytes(string sourceImagePath, SKRectI cropRect)
         {
             // 1. Load
@@ -220,44 +297,42 @@ namespace CardChooser.Services
                 ?? throw new InvalidOperationException(
                     $"SkiaSharp could not decode '{Path.GetFileName(sourceImagePath)}'.");
 
-            // 2. Resize to 3000 × 4159 using Catmull-Rom (high-quality for both up- and down-scale)
-            var targetInfo = new SKImageInfo(TargetCardWidth, TargetCardHeight, source.ColorType, source.AlphaType);
-            using SKBitmap resized = source.Resize(targetInfo, new SKSamplingOptions(SKCubicResampler.CatmullRom))
+            // 2. Resize to 3000 × 4159 using Catmull-Rom cubic resampling
+            var targetInfo = new SKImageInfo(TargetCardWidth, TargetCardHeight,
+                                             source.ColorType, source.AlphaType);
+            using SKBitmap resized = source.Resize(targetInfo,
+                                         new SKSamplingOptions(SKCubicResampler.CatmullRom))
                 ?? throw new InvalidOperationException("Resize returned null.");
 
             // 3. Crop to M15 art frame
             using SKBitmap artBitmap = ExtractCrop(resized, cropRect);
 
-            // ── Verification: confirm crop dimensions before enhancement ─────
+            // ── Verification: log crop size before enhancement ─────────────
             // Expected: 2527 × 1827 px @ 1200 DPI (≈ 2.106" × 1.523", verified in Photoshop).
-            // A mismatch means the crop constants need recalibration for this source image format.
             bool cropOk = artBitmap.Width == ExpectedArtWidth && artBitmap.Height == ExpectedArtHeight;
             string sizeLabel = cropOk
                 ? $"{artBitmap.Width} × {artBitmap.Height} px ✓"
                 : $"{artBitmap.Width} × {artBitmap.Height} px  ⚠ expected {ExpectedArtWidth} × {ExpectedArtHeight}";
             Console.WriteLine($"    crop size : {sizeLabel}");
 
-            // 4. Denoise — gentle Gaussian blur to suppress JPEG compression artefacts
+            // 4. Denoise — Gaussian blur (σ = 0.5)
             using SKBitmap denoised = ApplyBlur(artBitmap, DenoiseSigma);
 
-            // 5. Sharpen — 3×3 Laplacian unsharp-mask kernel
+            // 5. Sharpen — 3×3 Laplacian unsharp-mask
             using SKBitmap sharpened = ApplySharpen(denoised);
 
             // 6. JPEG encode
             using SKImage artImage = SKImage.FromBitmap(sharpened);
-            using SKData encoded = artImage.Encode(SKEncodedImageFormat.Jpeg, JpegQuality)
+            using SKData  encoded  = artImage.Encode(SKEncodedImageFormat.Jpeg, JpegQuality)
                 ?? throw new InvalidOperationException("JPEG encoding returned null.");
 
             return encoded.ToArray();
         }
 
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
         // Image helpers
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Crops a region from <paramref name="source"/> and returns it as a new independent bitmap.
-        /// </summary>
         private static SKBitmap ExtractCrop(SKBitmap source, SKRectI cropRect)
         {
             var artBitmap = new SKBitmap(cropRect.Width, cropRect.Height);
@@ -269,25 +344,16 @@ namespace CardChooser.Services
             return artBitmap;
         }
 
-        /// <summary>
-        /// Applies a Gaussian blur of the specified sigma to <paramref name="source"/>.
-        /// Used for noise/JPEG artefact reduction before sharpening.
-        /// </summary>
         private static SKBitmap ApplyBlur(SKBitmap source, float sigma)
         {
             var result = new SKBitmap(source.Width, source.Height);
             using var filter = SKImageFilter.CreateBlur(sigma, sigma);
             using var paint  = new SKPaint { ImageFilter = filter };
             using var canvas = new SKCanvas(result);
-            // Use nearest-neighbour sampling (no rescaling — 1:1 draw)
             canvas.DrawBitmap(source, 0, 0, new SKSamplingOptions(), paint);
             return result;
         }
 
-        /// <summary>
-        /// Applies the <see cref="SharpenKernel"/> (3×3 Laplacian, sum=1) to <paramref name="source"/>
-        /// to enhance edge clarity after the denoise step.
-        /// </summary>
         private static SKBitmap ApplySharpen(SKBitmap source)
         {
             var result = new SKBitmap(source.Width, source.Height);
@@ -301,62 +367,50 @@ namespace CardChooser.Services
                 convolveAlpha: false);
             using var paint  = new SKPaint { ImageFilter = filter };
             using var canvas = new SKCanvas(result);
-            // Use nearest-neighbour sampling (no rescaling — 1:1 draw)
             canvas.DrawBitmap(source, 0, 0, new SKSamplingOptions(), paint);
             return result;
         }
 
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
         // AI Super-Resolution (realesrgan-ncnn-vulkan CLI)
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Resolves <see cref="AiSrToolPath"/> to a full absolute path by looking next to the
-        /// running application (<see cref="AppContext.BaseDirectory"/>). This ensures the tool is
-        /// found regardless of the process working directory.
-        /// Returns an empty string when the file cannot be located.
+        /// Resolves the tool path relative to <see cref="AppContext.BaseDirectory"/> (next to the
+        /// compiled exe), with a CWD fallback.  Returns empty string if not found.
         /// </summary>
         private static string GetAiSrToolFullPath()
         {
             if (string.IsNullOrWhiteSpace(AiSrToolPath)) return string.Empty;
 
-            // If the constant is already absolute, use it directly.
             if (Path.IsPathRooted(AiSrToolPath))
                 return File.Exists(AiSrToolPath) ? AiSrToolPath : string.Empty;
 
-            // Resolve relative path from the application's base directory
-            // (works whether the app is run via `dotnet run` or as a published exe).
             string appBasePath = Path.Combine(AppContext.BaseDirectory, AiSrToolPath);
             if (File.Exists(appBasePath)) return appBasePath;
 
-            // Fallback: try the current working directory
             if (File.Exists(AiSrToolPath)) return Path.GetFullPath(AiSrToolPath);
 
             return string.Empty;
         }
 
-        /// <summary>
-        /// Returns <c>true</c> when <see cref="AiSrToolPath"/> can be resolved to an existing executable.
-        /// </summary>
         private static bool IsAiSrToolAvailable() =>
             !string.IsNullOrWhiteSpace(GetAiSrToolFullPath());
 
         /// <summary>
-        /// Calls <c>realesrgan-ncnn-vulkan.exe</c> to upscale <paramref name="inputPath"/> by
-        /// <see cref="AiSrScale"/>× and save the result to <paramref name="outputPath"/>.
-        /// Returns <c>true</c> on success.
+        /// Launches realesrgan-ncnn-vulkan with GPU-optimised flags and waits for it to finish.
+        /// <list type="bullet">
+        ///   <item><c>-g 0</c>  — use GPU 0 (RTX 3080) explicitly</item>
+        ///   <item><c>-t 0</c>  — auto tile-size (maximises 10 GB VRAM; fewer GPU passes)</item>
+        ///   <item><c>-j 1:4:1</c> — 4 GPU compute threads for RTX 3080 throughput</item>
+        /// </list>
         /// </summary>
-        /// <remarks>
-        /// The tool is located via <see cref="GetAiSrToolFullPath"/> — it is copied to the build
-        /// output directory by the project file, so it always lives next to <c>CardChooser.exe</c>.
-        /// </remarks>
         private static async Task<bool> RunSuperResolutionAsync(string inputPath, string outputPath)
         {
             string toolPath = GetAiSrToolFullPath();
             if (string.IsNullOrWhiteSpace(toolPath)) return false;
 
-            // Resolve models folder relative to the same directory as the tool
-            string toolDir      = Path.GetDirectoryName(toolPath) ?? AppContext.BaseDirectory;
+            string toolDir       = Path.GetDirectoryName(toolPath) ?? AppContext.BaseDirectory;
             string modelsAbsPath = Path.Combine(toolDir, AiSrModelsFolder);
 
             try
@@ -366,9 +420,12 @@ namespace CardChooser.Services
                     StartInfo = new ProcessStartInfo
                     {
                         FileName  = toolPath,
-                        Arguments = $"-i \"{inputPath}\" -o \"{outputPath}\" " +
+                        Arguments = $"-i \"{inputPath}\" -o \"{outputPath}\" "    +
                                     $"-n {AiSrModelName} -s {AiSrScale} -f jpg " +
-                                    $"-m \"{modelsAbsPath}\"",
+                                    $"-m \"{modelsAbsPath}\" "                    +
+                                    $"-g {AiSrGpuId} "                            +
+                                    $"-t {AiSrTileSize} "                         +
+                                    $"-j {AiSrThreadConfig}",
                         UseShellExecute        = false,
                         RedirectStandardOutput = true,
                         RedirectStandardError  = true,
@@ -378,7 +435,6 @@ namespace CardChooser.Services
 
                 process.Start();
                 await process.WaitForExitAsync();
-
                 return process.ExitCode == 0 && File.Exists(outputPath);
             }
             catch
@@ -387,52 +443,34 @@ namespace CardChooser.Services
             }
         }
 
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
         // JFIF DPI header patching
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Patches the JFIF APP0 segment in a JPEG byte array to embed the specified DPI.
-        /// Silently does nothing if the header is absent or malformed.
+        /// Patches the JFIF APP0 segment of a JPEG byte array to embed the specified DPI.
         /// </summary>
-        /// <remarks>
-        /// JFIF APP0 layout (byte offsets from start of file):
-        /// <code>
-        ///  0- 1   FF D8          SOI
-        ///  2- 3   FF E0          APP0 marker
-        ///  4- 5   00 10          Segment length = 16
-        ///  6-10   4A 46 49 46 00 "JFIF\0"
-        /// 11-12   01 01          Version 1.1
-        ///    13   01             Units: 0=none, 1=DPI, 2=DPCM
-        /// 14-15   XX XX          Xdensity (big-endian uint16)
-        /// 16-17   XX XX          Ydensity (big-endian uint16)
-        /// </code>
-        /// </remarks>
         private static void SetJfifDpi(byte[] jpegBytes, int dpi)
         {
             if (jpegBytes.Length < JfifMinLength) return;
-            if (jpegBytes[0] != 0xFF || jpegBytes[1] != 0xD8) return; // not JPEG
-            if (jpegBytes[2] != 0xFF || jpegBytes[3] != 0xE0) return; // no APP0
+            if (jpegBytes[0] != 0xFF || jpegBytes[1] != 0xD8) return;
+            if (jpegBytes[2] != 0xFF || jpegBytes[3] != 0xE0) return;
             if (jpegBytes[6] != 0x4A || jpegBytes[7] != 0x46 ||
-                jpegBytes[8] != 0x49 || jpegBytes[9] != 0x46) return; // no "JFIF"
+                jpegBytes[8] != 0x49 || jpegBytes[9] != 0x46) return;
 
             byte hi = (byte)(dpi >> 8);
             byte lo = (byte)(dpi & 0xFF);
-
-            jpegBytes[JfifUnitsOffset]         = 0x01; // pixels/inch
-            jpegBytes[JfifXDensityOffset]      = hi;
-            jpegBytes[JfifXDensityOffset + 1]  = lo;
-            jpegBytes[JfifYDensityOffset]      = hi;
-            jpegBytes[JfifYDensityOffset + 1]  = lo;
+            jpegBytes[JfifUnitsOffset]        = 0x01;
+            jpegBytes[JfifXDensityOffset]     = hi;
+            jpegBytes[JfifXDensityOffset + 1] = lo;
+            jpegBytes[JfifYDensityOffset]     = hi;
+            jpegBytes[JfifYDensityOffset + 1] = lo;
         }
 
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
         // Geometry helpers
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Computes the art frame crop rectangle in pixels for the 3000 × 4159 resized card image.
-        /// </summary>
         private static SKRectI ComputeArtCropRectangle()
         {
             int x      = (int)(TargetCardWidth  * ArtFrameLeft);    //  231 px
@@ -442,9 +480,9 @@ namespace CardChooser.Services
             return new SKRectI(x, y, x + width, y + height);
         }
 
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
         // File system helpers
-        // ────────────────────────────────────────────────────────────────────
+        // ════════════════════════════════════════════════════════════════════
 
         private static IReadOnlyList<string> DiscoverJpegs(string folder) =>
             Directory
