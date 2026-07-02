@@ -4,11 +4,15 @@ using CardChooser.Services.Interfaces;
 namespace CardChooser
 {
     /// <summary>
-    /// Entry point for the Card Chooser application.
-    /// Uses dependency injection to wire up services following SOLID principles.
+    /// Entry point for the MTG Card Chooser application.
+    /// Uses manual dependency injection to wire up all services, following SOLID principles.
     /// </summary>
-    class Program
+    internal class Program
     {
+        /// <summary>
+        /// Application entry point. Constructs the service graph and runs the card-processing workflow.
+        /// </summary>
+        /// <param name="args">Command-line arguments (currently unused).</param>
         static async Task Main(string[] args)
         {
             // Manual Dependency Injection - create service instances

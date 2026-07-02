@@ -4,8 +4,10 @@ using CardChooser.Services.Interfaces;
 namespace CardChooser.Services
 {
     /// <summary>
-    /// Service that orchestrates the card processing workflow.
-    /// Follows the Single Responsibility Principle by delegating specific tasks to specialized services.
+    /// Orchestrates the full card-processing workflow: loading configuration, scanning files,
+    /// copying found cards to the output folder, reporting missing cards, and downloading their
+    /// images from Scryfall.
+    /// Follows the Single Responsibility Principle by delegating specific tasks to specialised services.
     /// </summary>
     public class CardProcessorService : ICardProcessorService
     {
@@ -17,6 +19,14 @@ namespace CardChooser.Services
         private readonly IReportService _reportService;
         private readonly IScryfallService _scryfallService;
 
+        /// <summary>
+        /// Initialises a new instance of <see cref="CardProcessorService"/> with all required dependencies.
+        /// </summary>
+        /// <param name="configurationService">Service for loading and validating configuration.</param>
+        /// <param name="cardParserService">Service for parsing card names from the input file.</param>
+        /// <param name="fileOperationsService">Service for file-system search and copy operations.</param>
+        /// <param name="reportService">Service for console output and report generation.</param>
+        /// <param name="scryfallService">Service for downloading card images from the Scryfall API.</param>
         public CardProcessorService(
             IConfigurationService configurationService,
             ICardParserService cardParserService,
@@ -81,8 +91,8 @@ namespace CardChooser.Services
 
                 // Generate missing cards report
                 var missingCards = processedCards
-                    .Where(c => !c.Found)
-                    .Select(c => c.Name)
+                    .Where(card => !card.Found)
+                    .Select(card => card.Name)
                     .ToList();
 
                 _reportService.GenerateMissingCardsReport(missingCards, config.OutputFolder, config.MissingCardsReport);
@@ -108,6 +118,14 @@ namespace CardChooser.Services
             }
         }
 
+        /// <summary>
+        /// Searches for a single card in the source folder and copies any matching files
+        /// to the output folder. Returns a <see cref="CardInfo"/> with the result.
+        /// </summary>
+        /// <param name="cardName">The card name to search for.</param>
+        /// <param name="sourceFolder">Folder to search within.</param>
+        /// <param name="outputFolder">Folder to copy found files into.</param>
+        /// <returns>A <see cref="CardInfo"/> indicating whether the card was found and which files matched.</returns>
         private CardInfo ProcessCard(string cardName, string sourceFolder, string outputFolder)
         {
             var cardInfo = new CardInfo { Name = cardName };
@@ -124,6 +142,10 @@ namespace CardChooser.Services
             return cardInfo;
         }
 
+        /// <summary>
+        /// Prints a usage hint to the console explaining the required config.txt format.
+        /// Called when configuration loading fails with a <see cref="FileNotFoundException"/>.
+        /// </summary>
         private static void DisplayConfigurationHelp()
         {
             Console.WriteLine("Please create a config.txt file with the following format:");

@@ -54,14 +54,22 @@ namespace CardChooser.Services
 
             bool[] results = await Task.WhenAll(downloadTasks);
 
-            int successCount = results.Count(r => r);
-            int failureCount = results.Count(r => !r);
+            int successCount = results.Count(result => result);
+            int failureCount = results.Count(result => !result);
 
             Console.WriteLine();
             Console.WriteLine($"Scryfall download complete: {successCount} succeeded, {failureCount} failed.");
             Console.WriteLine();
         }
 
+        /// <summary>
+        /// Attempts to download the image for a single card: fetches card JSON, extracts the
+        /// image URL, downloads the image bytes, and writes them to disk.
+        /// Returns <c>true</c> on success, <c>false</c> on any failure.
+        /// </summary>
+        /// <param name="cardName">The exact card name to look up on Scryfall.</param>
+        /// <param name="targetFolder">Folder where the image file will be saved.</param>
+        /// <returns><c>true</c> if the image was saved successfully; otherwise <c>false</c>.</returns>
         private async Task<bool> TryDownloadCardImageAsync(string cardName, string targetFolder)
         {
             Console.Write($"  Downloading image for '{cardName}'... ");
@@ -179,24 +187,44 @@ namespace CardChooser.Services
             return null;
         }
 
+        /// <summary>
+        /// Builds the Scryfall API URL for an exact card-name JSON lookup.
+        /// </summary>
+        /// <param name="cardName">The card name to search for (will be URL-encoded).</param>
+        /// <returns>A fully formed request URL string.</returns>
         private static string BuildCardJsonUrl(string cardName)
         {
             string encodedName = Uri.EscapeDataString(cardName);
             return $"{ScryfallNamedCardBaseUrl}?exact={encodedName}";
         }
 
+        /// <summary>
+        /// Constructs the full file path where the card image will be saved.
+        /// </summary>
+        /// <param name="targetFolder">Destination directory.</param>
+        /// <param name="cardName">Card name used to derive the file name.</param>
+        /// <returns>Absolute file path for the image.</returns>
         private static string BuildImageFilePath(string targetFolder, string cardName)
         {
             string safeFileName = SanitizeFileName(cardName) + ImageExtension;
             return Path.Combine(targetFolder, safeFileName);
         }
 
+        /// <summary>
+        /// Replaces any characters that are illegal in file names with an underscore.
+        /// </summary>
+        /// <param name="name">The raw string to sanitise.</param>
+        /// <returns>A file-system-safe version of the input string.</returns>
         private static string SanitizeFileName(string name)
         {
             char[] invalidChars = Path.GetInvalidFileNameChars();
             return string.Join("_", name.Split(invalidChars, StringSplitOptions.RemoveEmptyEntries)).Trim();
         }
 
+        /// <summary>
+        /// Creates the specified directory (and any missing parents) if it does not already exist.
+        /// </summary>
+        /// <param name="path">Directory path to ensure exists.</param>
         private static void EnsureDirectoryExists(string path)
         {
             if (!Directory.Exists(path))
