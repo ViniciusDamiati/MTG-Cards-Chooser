@@ -60,13 +60,20 @@ namespace CardChooser.Services
 
         // ── AI Super-Resolution (optional) ───────────────────────────────────
         // Path to the realesrgan-ncnn-vulkan executable.
-        // Download the release from https://github.com/xinntao/Real-ESRGAN/releases
-        // and either place the .exe next to this application, or update this path.
+        // The exe, vcomp140.dll, vcomp140d.dll, and the models folder are expected
+        // in the project root (next to CardChooser.exe when running via dotnet run).
         // Set to an empty string to disable AI super-resolution entirely.
         private const string AiSrToolPath = "realesrgan-ncnn-vulkan.exe";
 
-        // Model used for AI SR. "realesr-animevideov3" works well for painted card art.
-        // Alternatives: "realesrgan-x4plus"  (photo-realistic), "RealESRGAN_x4plus_anime_6B"
+        // Folder containing the .bin/.param model weight files (relative to CWD).
+        // Maps to d:\Projects\MTG\MTG-Cards-Chooser\realesrgan-models\
+        private const string AiSrModelsFolder = "realesrgan-models";
+
+        // Model name (without scale suffix or extension).
+        // Available models in realesrgan-models/:
+        //   realesr-animevideov3       — fast, painted/anime art  (1.2 MB, default)
+        //   realesrgan-x4plus-anime    — higher quality illustration (8.9 MB)
+        //   realesrgan-x4plus          — photo-realistic images  (33 MB)
         private const string AiSrModelName = "realesr-animevideov3";
         private const int AiSrScale = 4;
 
@@ -309,8 +316,9 @@ namespace CardChooser.Services
                     StartInfo = new ProcessStartInfo
                     {
                         FileName  = AiSrToolPath,
-                        Arguments = $"-i \"{inputPath}\" -o \"{outputPath}\" " +
-                                    $"-n {AiSrModelName} -s {AiSrScale} -f jpg",
+                    Arguments = $"-i \"{inputPath}\" -o \"{outputPath}\" " +
+                                    $"-n {AiSrModelName} -s {AiSrScale} -f jpg " +
+                                    $"-m \"{AiSrModelsFolder}\"",
                         UseShellExecute        = false,
                         RedirectStandardOutput = true,
                         RedirectStandardError  = true,
