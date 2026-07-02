@@ -1,23 +1,27 @@
+using System.Diagnostics;
 using SkiaSharp;
 using CardChooser.Services.Interfaces;
 
 namespace CardChooser.Services
 {
     /// <summary>
-    /// Extracts card art from Scryfall card images using SkiaSharp (Google Skia engine) —
-    /// pure C# image processing, no Photoshop or licensed libraries required.
+    /// Extracts and enhances card art from Scryfall card images using SkiaSharp (Google Skia engine).
     ///
     /// Pipeline per image:
-    ///   1. Load the Scryfall JPEG (typically 672 × 936 px).
-    ///   2. Resize to 3000 × 4159 px using Catmull-Rom cubic resampling
-    ///      (high-quality enlargement equivalent to Photoshop "Preserve Details").
-    ///   3. Crop to the standard M15 art frame, discarding card border,
-    ///      name bar, type line, text box, and legal text.
-    ///   4. Encode as JPEG (quality 95) and patch the JFIF header to embed 1200 DPI.
-    ///   5. Save the art-only file to the output folder.
+    ///   1. [Optional] AI Super-Resolution — if <c>realesrgan-ncnn-vulkan.exe</c> is present at
+    ///      <see cref="AiSrToolPath"/>, upscale the original Scryfall JPEG 4× before any other
+    ///      processing (672×936 → 2688×3744). Produces far sharper detail than bicubic upscaling.
+    ///   2. Resize to 3000 × 4159 px using Catmull-Rom cubic resampling, matching the Proxyshop
+    ///      PSD template canvas (equivalent to Photoshop "Preserve Details" enlargement).
+    ///   3. Crop to the standard M15 art frame, discarding border, name bar, text box, etc.
+    ///   4. Denoise — gentle Gaussian blur (σ = 0.5) to suppress JPEG compression artefacts
+    ///      without softening edges.
+    ///   5. Sharpen — 3×3 Laplacian unsharp-mask kernel to recover fine edge detail.
+    ///   6. Encode as JPEG (quality 95) and patch the JFIF header to embed 1200 DPI.
+    ///   7. Save to <c>scryfall_images/cards_arts/</c>.
     ///
-    /// Art frame crop constants are fractions of the full resized card dimensions.
-    /// Adjust the ArtFrame* constants if a specific card style requires a different crop.
+    /// All constants (crop percentages, blur sigma, kernel, quality) are defined at the top of
+    /// this class and can be tuned without touching any other file.
     /// </summary>
     public class CardArtExtractorService : ICardArtExtractorService
     {
@@ -26,27 +30,54 @@ namespace CardChooser.Services
         private const int TargetCardHeight = 4159;
         private const int TargetDpi = 1200;
 
-        // ── Art frame position as fractions of the resized card image ────────
-        // Calibrated for the standard M15 card layout on a Scryfall 'large' scan.
-        // Physical result at 1200 DPI: ≈ 53 mm × 40 mm — matches the actual print art frame.
-        // Tune these constants if the crop is off for a particular card style.
-        private const double ArtFrameLeft = 0.080;    // 8.0 % from the left edge
-        private const double ArtFrameTop = 0.135;     // 13.5 % from the top (below name/mana bar)
-        private const double ArtFrameWidth = 0.840;   // 84.0 % of card width  → 2520 px
-        private const double ArtFrameHeight = 0.450;  // 45.0 % of card height → 1872 px
+        // ── Art frame position (fractions of the full resized card image) ─────
+        // Calibrated for M15 cards on a Scryfall 'large' scan.
+        // Physical result at 1200 DPI: ≈ 53 mm × 40 mm — matches the print art frame.
+        // Adjust if the crop is off for a specific card style.
+        private const double ArtFrameLeft = 0.080;    //  8.0 % → 240 px left edge
+        private const double ArtFrameTop = 0.135;     // 13.5 % → 561 px top edge (below name bar)
+        private const double ArtFrameWidth = 0.840;   // 84.0 % → 2520 px wide
+        private const double ArtFrameHeight = 0.450;  // 45.0 % → 1872 px tall
 
-        // ── JPEG save quality ─────────────────────────────────────────────────
+        // ── Enhancement — denoise ────────────────────────────────────────────
+        // Gaussian sigma used for JPEG-artefact reduction before sharpening.
+        // Lower = less blurring (preserve more detail); higher = more noise removal.
+        private const float DenoiseSigma = 0.5f;
+
+        // ── Enhancement — sharpening kernel ─────────────────────────────────
+        // 3×3 eight-connected Laplacian with sum = 1 (brightness-preserving).
+        // Increase magnitude of negative weights for stronger sharpening.
+        private static readonly float[] SharpenKernel =
+        {
+            -0.25f, -0.5f, -0.25f,
+            -0.5f,   4.0f, -0.5f,
+            -0.25f, -0.5f, -0.25f
+        };
+        // sum = 4 + 4*(-0.5) + 4*(-0.25) = 4 - 2 - 1 = 1  ✓
+
+        // ── JPEG output quality ──────────────────────────────────────────────
         private const int JpegQuality = 95;
 
-        // ── File handling ─────────────────────────────────────────────────────
-        private const string JpegExtension = ".jpg";
+        // ── AI Super-Resolution (optional) ───────────────────────────────────
+        // Path to the realesrgan-ncnn-vulkan executable.
+        // Download the release from https://github.com/xinntao/Real-ESRGAN/releases
+        // and either place the .exe next to this application, or update this path.
+        // Set to an empty string to disable AI super-resolution entirely.
+        private const string AiSrToolPath = "realesrgan-ncnn-vulkan.exe";
 
-        // ── JFIF header offsets for DPI metadata ──────────────────────────────
-        // JPEG structure: FF D8 | FF E0 | len(2) | "JFIF\0"(5) | ver(2) | units | Xdpi(2) | Ydpi(2)
-        private const int JfifUnitsOffset = 13;    // byte index of the units field (1 = DPI)
-        private const int JfifXDensityOffset = 14; // big-endian uint16 for horizontal density
-        private const int JfifYDensityOffset = 16; // big-endian uint16 for vertical density
-        private const int JfifMinLength = 18;      // minimum bytes needed to contain the DPI fields
+        // Model used for AI SR. "realesr-animevideov3" works well for painted card art.
+        // Alternatives: "realesrgan-x4plus"  (photo-realistic), "RealESRGAN_x4plus_anime_6B"
+        private const string AiSrModelName = "realesr-animevideov3";
+        private const int AiSrScale = 4;
+
+        // ── JFIF DPI header offsets ──────────────────────────────────────────
+        private const int JfifUnitsOffset = 13;
+        private const int JfifXDensityOffset = 14;
+        private const int JfifYDensityOffset = 16;
+        private const int JfifMinLength = 18;
+
+        // ── File handling ────────────────────────────────────────────────────
+        private const string JpegExtension = ".jpg";
 
         /// <inheritdoc />
         public async Task ExtractArtsAsync(string sourceImagesFolder, string artOutputFolder)
@@ -67,7 +98,11 @@ namespace CardChooser.Services
                 return;
             }
 
-            Console.WriteLine($"Extracting card art from {imageFiles.Count} image(s) into '{artOutputFolder}'...");
+            bool aiSrAvailable = IsAiSrToolAvailable();
+            Console.WriteLine($"Extracting card art from {imageFiles.Count} image(s)...");
+            Console.WriteLine($"  AI super-resolution : {(aiSrAvailable ? $"ON  ({AiSrToolPath})" : "OFF (realesrgan-ncnn-vulkan.exe not found)")}");
+            Console.WriteLine($"  Denoise + sharpen   : ON (always)");
+            Console.WriteLine($"  Output folder       : {artOutputFolder}");
             Console.WriteLine();
 
             SKRectI cropRect = ComputeArtCropRectangle();
@@ -77,12 +112,9 @@ namespace CardChooser.Services
 
             foreach (string imageFile in imageFiles)
             {
-                bool succeeded = await TryExtractArtAsync(imageFile, artOutputFolder, cropRect);
-
-                if (succeeded)
-                    successCount++;
-                else
-                    failureCount++;
+                bool succeeded = await TryExtractArtAsync(imageFile, artOutputFolder, cropRect, aiSrAvailable);
+                if (succeeded) successCount++;
+                else           failureCount++;
             }
 
             Console.WriteLine();
@@ -90,144 +122,278 @@ namespace CardChooser.Services
             Console.WriteLine();
         }
 
+        // ────────────────────────────────────────────────────────────────────
+        // Per-image pipeline
+        // ────────────────────────────────────────────────────────────────────
+
         /// <summary>
-        /// Processes a single card image: resize → crop → encode → patch DPI → write.
-        /// Offloads all CPU-bound image work to the thread pool via <see cref="Task.Run"/>.
+        /// Processes one card image through the full pipeline and writes the result.
+        /// If the AI SR tool is available, it is applied to the original small JPEG
+        /// before the main resize, giving far better upscaling quality.
         /// </summary>
-        /// <param name="sourceImagePath">Full path to the Scryfall JPEG.</param>
-        /// <param name="artOutputFolder">Destination folder for the cropped art.</param>
-        /// <param name="cropRect">Pre-computed art frame crop rectangle (pixels in the resized image).</param>
-        /// <returns><c>true</c> on success; <c>false</c> on any error.</returns>
         private static async Task<bool> TryExtractArtAsync(
             string sourceImagePath,
             string artOutputFolder,
-            SKRectI cropRect)
+            SKRectI cropRect,
+            bool aiSrAvailable)
         {
             string cardFileName = Path.GetFileName(sourceImagePath);
+            string? tempSrPath = null;
 
             try
             {
-                // Offload CPU-bound work (decode, resize, crop, encode) to the thread pool
-                byte[] jpegBytes = await Task.Run(() => ProcessCardImageToBytes(sourceImagePath, cropRect));
+                string inputPath = sourceImagePath;
 
-                // Patch the JFIF header in-memory to record 1200 DPI
+                // ── Step 1 (optional): AI super-resolution ───────────────────
+                if (aiSrAvailable)
+                {
+                    tempSrPath = Path.Combine(Path.GetTempPath(), $"sr_{Guid.NewGuid():N}_{cardFileName}");
+                    bool srOk = await RunSuperResolutionAsync(sourceImagePath, tempSrPath);
+                    if (srOk)
+                    {
+                        inputPath = tempSrPath;
+                        Console.Write($"  '{cardFileName}' [SR OK]");
+                    }
+                    else
+                    {
+                        Console.Write($"  '{cardFileName}' [SR FAILED — using Catmull-Rom]");
+                    }
+                }
+
+                // ── Steps 2-5: Resize → Crop → Denoise → Sharpen ────────────
+                byte[] jpegBytes = await Task.Run(() => ProcessCardImageToBytes(inputPath, cropRect));
+
+                // ── Step 6: Patch JFIF header to embed 1200 DPI ──────────────
                 SetJfifDpi(jpegBytes, TargetDpi);
 
-                // Write the finished art file
+                // ── Step 7: Write art file ───────────────────────────────────
                 string outputPath = Path.Combine(artOutputFolder, cardFileName);
                 await File.WriteAllBytesAsync(outputPath, jpegBytes);
 
-                Console.WriteLine($"  '{cardFileName}'... OK");
+                if (!aiSrAvailable) Console.Write($"  '{cardFileName}'");
+                Console.WriteLine(" ... OK");
                 return true;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"  '{cardFileName}'... FAILED ({ex.Message})");
+                Console.WriteLine($"  '{cardFileName}' ... FAILED ({ex.Message})");
                 return false;
+            }
+            finally
+            {
+                if (tempSrPath is not null && File.Exists(tempSrPath))
+                    File.Delete(tempSrPath);
             }
         }
 
+        // ────────────────────────────────────────────────────────────────────
+        // Image processing (synchronous, runs on thread pool via Task.Run)
+        // ────────────────────────────────────────────────────────────────────
+
         /// <summary>
-        /// Performs the full image processing pipeline synchronously (suitable for <see cref="Task.Run"/>):
-        /// load → resize → crop → JPEG encode.
+        /// Core synchronous image pipeline: load → resize → crop → denoise → sharpen → encode.
         /// </summary>
-        /// <param name="sourceImagePath">Full path to the source Scryfall JPEG.</param>
-        /// <param name="cropRect">Art frame crop rectangle in the resized image's coordinate space.</param>
-        /// <returns>Raw JPEG bytes of the cropped art image.</returns>
         private static byte[] ProcessCardImageToBytes(string sourceImagePath, SKRectI cropRect)
         {
-            // Load source image
+            // 1. Load
             using SKBitmap source = SKBitmap.Decode(sourceImagePath)
-                ?? throw new InvalidOperationException($"SkiaSharp could not decode '{Path.GetFileName(sourceImagePath)}'.");
+                ?? throw new InvalidOperationException(
+                    $"SkiaSharp could not decode '{Path.GetFileName(sourceImagePath)}'.");
 
-            // Resize to 3000 × 4159 using Catmull-Rom cubic resampling (high-quality enlargement)
+            // 2. Resize to 3000 × 4159 using Catmull-Rom (high-quality for both up- and down-scale)
             var targetInfo = new SKImageInfo(TargetCardWidth, TargetCardHeight, source.ColorType, source.AlphaType);
             using SKBitmap resized = source.Resize(targetInfo, new SKSamplingOptions(SKCubicResampler.CatmullRom))
                 ?? throw new InvalidOperationException("Resize returned null.");
 
-            // Crop: draw the art frame area of the resized card into a new bitmap.
-            // Use the SKSamplingOptions overload (DrawBitmap with two rects defaults to the
-            // deprecated SKPaint overload in SkiaSharp 4.x).
-            using SKBitmap artBitmap = new(cropRect.Width, cropRect.Height);
-            using (var canvas = new SKCanvas(artBitmap))
-            {
-                var srcRect = new SKRect(cropRect.Left, cropRect.Top, cropRect.Right, cropRect.Bottom);
-                var dstRect = new SKRect(0, 0, cropRect.Width, cropRect.Height);
-                canvas.DrawBitmap(resized, srcRect, dstRect,
-                    new SKSamplingOptions(SKCubicResampler.CatmullRom), paint: null);
-            }
+            // 3. Crop to M15 art frame
+            using SKBitmap artBitmap = ExtractCrop(resized, cropRect);
 
-            // Encode as JPEG and return as byte array
-            using SKImage artImage = SKImage.FromBitmap(artBitmap);
+            // 4. Denoise — gentle Gaussian blur to suppress JPEG compression artefacts
+            using SKBitmap denoised = ApplyBlur(artBitmap, DenoiseSigma);
+
+            // 5. Sharpen — 3×3 Laplacian unsharp-mask kernel
+            using SKBitmap sharpened = ApplySharpen(denoised);
+
+            // 6. JPEG encode
+            using SKImage artImage = SKImage.FromBitmap(sharpened);
             using SKData encoded = artImage.Encode(SKEncodedImageFormat.Jpeg, JpegQuality)
                 ?? throw new InvalidOperationException("JPEG encoding returned null.");
 
             return encoded.ToArray();
         }
 
+        // ────────────────────────────────────────────────────────────────────
+        // Image helpers
+        // ────────────────────────────────────────────────────────────────────
+
         /// <summary>
-        /// Patches the JFIF APP0 header inside a JPEG byte array to set the horizontal and vertical
-        /// density (DPI) to the specified value.  Silently does nothing if the header is absent or malformed.
+        /// Crops a region from <paramref name="source"/> and returns it as a new independent bitmap.
+        /// </summary>
+        private static SKBitmap ExtractCrop(SKBitmap source, SKRectI cropRect)
+        {
+            var artBitmap = new SKBitmap(cropRect.Width, cropRect.Height);
+            using var canvas = new SKCanvas(artBitmap);
+            var src = new SKRect(cropRect.Left, cropRect.Top, cropRect.Right, cropRect.Bottom);
+            var dst = new SKRect(0, 0, cropRect.Width, cropRect.Height);
+            canvas.DrawBitmap(source, src, dst,
+                new SKSamplingOptions(SKCubicResampler.CatmullRom), paint: null);
+            return artBitmap;
+        }
+
+        /// <summary>
+        /// Applies a Gaussian blur of the specified sigma to <paramref name="source"/>.
+        /// Used for noise/JPEG artefact reduction before sharpening.
+        /// </summary>
+        private static SKBitmap ApplyBlur(SKBitmap source, float sigma)
+        {
+            var result = new SKBitmap(source.Width, source.Height);
+            using var filter = SKImageFilter.CreateBlur(sigma, sigma);
+            using var paint  = new SKPaint { ImageFilter = filter };
+            using var canvas = new SKCanvas(result);
+            // Use nearest-neighbour sampling (no rescaling — 1:1 draw)
+            canvas.DrawBitmap(source, 0, 0, new SKSamplingOptions(), paint);
+            return result;
+        }
+
+        /// <summary>
+        /// Applies the <see cref="SharpenKernel"/> (3×3 Laplacian, sum=1) to <paramref name="source"/>
+        /// to enhance edge clarity after the denoise step.
+        /// </summary>
+        private static SKBitmap ApplySharpen(SKBitmap source)
+        {
+            var result = new SKBitmap(source.Width, source.Height);
+            using var filter = SKImageFilter.CreateMatrixConvolution(
+                kernelSize:    new SKSizeI(3, 3),
+                kernel:        SharpenKernel,
+                gain:          1f,
+                bias:          0f,
+                kernelOffset:  new SKPointI(1, 1),
+                tileMode:      SKShaderTileMode.Clamp,
+                convolveAlpha: false);
+            using var paint  = new SKPaint { ImageFilter = filter };
+            using var canvas = new SKCanvas(result);
+            // Use nearest-neighbour sampling (no rescaling — 1:1 draw)
+            canvas.DrawBitmap(source, 0, 0, new SKSamplingOptions(), paint);
+            return result;
+        }
+
+        // ────────────────────────────────────────────────────────────────────
+        // AI Super-Resolution (realesrgan-ncnn-vulkan CLI)
+        // ────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Returns <c>true</c> when <see cref="AiSrToolPath"/> points to an existing executable.
+        /// </summary>
+        private static bool IsAiSrToolAvailable() =>
+            !string.IsNullOrWhiteSpace(AiSrToolPath) && File.Exists(AiSrToolPath);
+
+        /// <summary>
+        /// Calls <c>realesrgan-ncnn-vulkan.exe</c> to upscale <paramref name="inputPath"/> by
+        /// <see cref="AiSrScale"/>× and save the result to <paramref name="outputPath"/>.
+        /// Returns <c>true</c> on success.
         /// </summary>
         /// <remarks>
-        /// JFIF APP0 layout (byte indices from start of file):
+        /// The tool can be downloaded from: https://github.com/xinntao/Real-ESRGAN/releases
+        /// Recommended models for card art:
+        ///   • <c>realesr-animevideov3</c>  — painted/anime-style illustration (default)
+        ///   • <c>realesrgan-x4plus</c>     — photo-realistic images
+        /// Place <c>realesrgan-ncnn-vulkan.exe</c> and its <c>models/</c> folder next to
+        /// <c>CardChooser.exe</c> (or update <see cref="AiSrToolPath"/>).
+        /// </remarks>
+        private static async Task<bool> RunSuperResolutionAsync(string inputPath, string outputPath)
+        {
+            try
+            {
+                using var process = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName  = AiSrToolPath,
+                        Arguments = $"-i \"{inputPath}\" -o \"{outputPath}\" " +
+                                    $"-n {AiSrModelName} -s {AiSrScale} -f jpg",
+                        UseShellExecute        = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError  = true,
+                        CreateNoWindow         = true
+                    }
+                };
+
+                process.Start();
+                await process.WaitForExitAsync();
+
+                return process.ExitCode == 0 && File.Exists(outputPath);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // ────────────────────────────────────────────────────────────────────
+        // JFIF DPI header patching
+        // ────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Patches the JFIF APP0 segment in a JPEG byte array to embed the specified DPI.
+        /// Silently does nothing if the header is absent or malformed.
+        /// </summary>
+        /// <remarks>
+        /// JFIF APP0 layout (byte offsets from start of file):
         /// <code>
-        ///  0- 1   FF D8          SOI marker
+        ///  0- 1   FF D8          SOI
         ///  2- 3   FF E0          APP0 marker
-        ///  4- 5   00 10          Segment length (16, big-endian)
+        ///  4- 5   00 10          Segment length = 16
         ///  6-10   4A 46 49 46 00 "JFIF\0"
         /// 11-12   01 01          Version 1.1
-        ///    13   01             Units  (0=none, 1=DPI, 2=DPCM)
+        ///    13   01             Units: 0=none, 1=DPI, 2=DPCM
         /// 14-15   XX XX          Xdensity (big-endian uint16)
         /// 16-17   XX XX          Ydensity (big-endian uint16)
         /// </code>
         /// </remarks>
-        /// <param name="jpegBytes">JPEG byte array to patch in-place.</param>
-        /// <param name="dpi">Target density in pixels-per-inch.</param>
         private static void SetJfifDpi(byte[] jpegBytes, int dpi)
         {
             if (jpegBytes.Length < JfifMinLength) return;
-
-            // Verify SOI + APP0 markers
-            if (jpegBytes[0] != 0xFF || jpegBytes[1] != 0xD8) return;
-            if (jpegBytes[2] != 0xFF || jpegBytes[3] != 0xE0) return;
-
-            // Verify "JFIF" signature at bytes 6–9
+            if (jpegBytes[0] != 0xFF || jpegBytes[1] != 0xD8) return; // not JPEG
+            if (jpegBytes[2] != 0xFF || jpegBytes[3] != 0xE0) return; // no APP0
             if (jpegBytes[6] != 0x4A || jpegBytes[7] != 0x46 ||
-                jpegBytes[8] != 0x49 || jpegBytes[9] != 0x46) return;
+                jpegBytes[8] != 0x49 || jpegBytes[9] != 0x46) return; // no "JFIF"
 
-            byte dpiHigh = (byte)(dpi >> 8);   // e.g. 0x04 for 1200
-            byte dpiLow  = (byte)(dpi & 0xFF); // e.g. 0xB0 for 1200  (0x04B0 = 1200)
+            byte hi = (byte)(dpi >> 8);
+            byte lo = (byte)(dpi & 0xFF);
 
-            jpegBytes[JfifUnitsOffset]     = 0x01;    // units = pixels/inch
-            jpegBytes[JfifXDensityOffset]  = dpiHigh;
-            jpegBytes[JfifXDensityOffset + 1] = dpiLow;
-            jpegBytes[JfifYDensityOffset]  = dpiHigh;
-            jpegBytes[JfifYDensityOffset + 1] = dpiLow;
+            jpegBytes[JfifUnitsOffset]         = 0x01; // pixels/inch
+            jpegBytes[JfifXDensityOffset]      = hi;
+            jpegBytes[JfifXDensityOffset + 1]  = lo;
+            jpegBytes[JfifYDensityOffset]      = hi;
+            jpegBytes[JfifYDensityOffset + 1]  = lo;
         }
 
+        // ────────────────────────────────────────────────────────────────────
+        // Geometry helpers
+        // ────────────────────────────────────────────────────────────────────
+
         /// <summary>
-        /// Computes the art frame crop rectangle in pixels for the resized 3000 × 4159 card image.
+        /// Computes the art frame crop rectangle in pixels for the 3000 × 4159 resized card image.
         /// </summary>
         private static SKRectI ComputeArtCropRectangle()
         {
-            int x      = (int)(TargetCardWidth  * ArtFrameLeft);    // 240
-            int y      = (int)(TargetCardHeight * ArtFrameTop);     // 561
-            int width  = (int)(TargetCardWidth  * ArtFrameWidth);   // 2520
-            int height = (int)(TargetCardHeight * ArtFrameHeight);  // 1872
+            int x      = (int)(TargetCardWidth  * ArtFrameLeft);    // 240 px
+            int y      = (int)(TargetCardHeight * ArtFrameTop);     // 561 px
+            int width  = (int)(TargetCardWidth  * ArtFrameWidth);   // 2520 px
+            int height = (int)(TargetCardHeight * ArtFrameHeight);  // 1872 px
             return new SKRectI(x, y, x + width, y + height);
         }
 
-        /// <summary>
-        /// Returns all JPEG files found directly inside <paramref name="folder"/> (non-recursive).
-        /// </summary>
+        // ────────────────────────────────────────────────────────────────────
+        // File system helpers
+        // ────────────────────────────────────────────────────────────────────
+
         private static IReadOnlyList<string> DiscoverJpegs(string folder) =>
             Directory
                 .EnumerateFiles(folder, $"*{JpegExtension}", SearchOption.TopDirectoryOnly)
                 .ToList()
                 .AsReadOnly();
 
-        /// <summary>Creates the directory (and all missing parents) if it does not already exist.</summary>
         private static void EnsureDirectoryExists(string path)
         {
             if (!Directory.Exists(path))
