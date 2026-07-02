@@ -31,13 +31,20 @@ namespace CardChooser.Services
         private const int TargetDpi = 1200;
 
         // ── Art frame position (fractions of the full resized card image) ─────
-        // Calibrated for M15 cards on a Scryfall 'large' scan.
-        // Physical result at 1200 DPI: ≈ 53 mm × 40 mm — matches the print art frame.
-        // Adjust if the crop is off for a specific card style.
-        private const double ArtFrameLeft = 0.080;    //  8.0 % → 240 px left edge
-        private const double ArtFrameTop = 0.135;     // 13.5 % → 561 px top edge (below name bar)
-        private const double ArtFrameWidth = 0.840;   // 84.0 % → 2520 px wide
-        private const double ArtFrameHeight = 0.450;  // 45.0 % → 1872 px tall
+        // Calibrated for standard M15 cards from Scryfall 'large' JPEGs (672 × 936 px source).
+        //
+        // M15 art-frame boundaries (measured on 672×936 Scryfall source, then scaled):
+        //   art top    ≈  86 px →  9.2 % of 936   →  ArtFrameTop   = 0.092
+        //   art bottom ≈ 496 px → 53.0 % of 936   →  bottom edge   @ 0.092 + 0.438 = 0.530
+        //   art left   ≈  52 px →  7.7 % of 672   →  ArtFrameLeft  = 0.077
+        //   art right  ≈ 620 px → 92.3 % of 672   →  width         = 0.846
+        //
+        // These values crop exactly to the printed art frame — no name bar, no type bar.
+        // Adjust only if a different Scryfall image style produces a misaligned crop.
+        private const double ArtFrameLeft   = 0.077;   //  7.7 % →  231 px left edge
+        private const double ArtFrameTop    = 0.092;   //  9.2 % →  383 px top edge
+        private const double ArtFrameWidth  = 0.846;   // 84.6 % → 2538 px wide
+        private const double ArtFrameHeight = 0.438;   // 43.8 % → 1822 px tall  (bottom @ 53.0 %)
 
         // ── Enhancement — denoise ────────────────────────────────────────────
         // Gaussian sigma used for JPEG-artefact reduction before sharpening.
@@ -385,10 +392,10 @@ namespace CardChooser.Services
         /// </summary>
         private static SKRectI ComputeArtCropRectangle()
         {
-            int x      = (int)(TargetCardWidth  * ArtFrameLeft);    // 240 px
-            int y      = (int)(TargetCardHeight * ArtFrameTop);     // 561 px
-            int width  = (int)(TargetCardWidth  * ArtFrameWidth);   // 2520 px
-            int height = (int)(TargetCardHeight * ArtFrameHeight);  // 1872 px
+            int x      = (int)(TargetCardWidth  * ArtFrameLeft);    //  231 px
+            int y      = (int)(TargetCardHeight * ArtFrameTop);     //  383 px
+            int width  = (int)(TargetCardWidth  * ArtFrameWidth);   // 2538 px
+            int height = (int)(TargetCardHeight * ArtFrameHeight);  // 1822 px  (bottom @ 2205 px = 53.0 %)
             return new SKRectI(x, y, x + width, y + height);
         }
 
