@@ -9,25 +9,27 @@ namespace CardChooser
     /// </summary>
     class Program
     {
-        static void Main(string[] args)
+        static async Task Main(string[] args)
         {
             // Manual Dependency Injection - create service instances
             IConfigurationService configurationService = new ConfigurationService();
             ICardParserService cardParserService = new CardParserService();
             IFileOperationsService fileOperationsService = new FileOperationsService();
             IReportService reportService = new ReportService();
+            IScryfallService scryfallService = new ScryfallService(new HttpClient());
 
             // Create the main processor with all dependencies
             ICardProcessorService cardProcessorService = new CardProcessorService(
                 configurationService,
                 cardParserService,
                 fileOperationsService,
-                reportService
+                reportService,
+                scryfallService
             );
 
             // Execute the card processing workflow
             const string configFilePath = "config.txt";
-            cardProcessorService.ProcessCards(configFilePath);
+            await cardProcessorService.ProcessCardsAsync(configFilePath);
         }
     }
 }

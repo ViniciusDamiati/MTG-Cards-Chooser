@@ -8,8 +8,9 @@ namespace CardChooser.Services.Interfaces
     {
         /// <summary>
         /// Processes all cards from the input file.
+        /// Downloads Scryfall images for any missing cards.
         /// </summary>
         /// <param name="configFilePath">Path to the configuration file.</param>
-        void ProcessCards(string configFilePath);
+        Task ProcessCardsAsync(string configFilePath);
     }
 }
