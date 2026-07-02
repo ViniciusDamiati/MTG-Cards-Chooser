@@ -15,9 +15,9 @@ namespace CardChooser.Services
         private const string ImageSize = "large";
         private const string ImageExtension = ".jpg";
 
-        // Scryfall rate limit: 2 requests/second.
-        // We make 2 HTTP calls per card (JSON + image), so delay 1s between cards.
-        private static readonly TimeSpan RateLimitDelay = TimeSpan.FromSeconds(1);
+        // Scryfall rate limit: 2 req/s. Each card makes 2 HTTP calls (JSON + image).
+        // Limiting to 2 concurrent card downloads keeps us at ~4 requests in-flight max.
+        private const int MaxConcurrentDownloads = 2;
 
         private readonly HttpClient _httpClient;
 
@@ -40,25 +40,36 @@ namespace CardChooser.Services
             Console.WriteLine($"Downloading {cardNames.Count} missing card image(s) from Scryfall into '{targetFolder}'...");
             Console.WriteLine();
 
-            int successCount = 0;
-            int failureCount = 0;
+            using var semaphore = new SemaphoreSlim(MaxConcurrentDownloads, MaxConcurrentDownloads);
 
-            foreach (var cardName in cardNames)
-            {
-                bool downloaded = await TryDownloadCardImageAsync(cardName, targetFolder);
+            IEnumerable<Task<bool>> downloadTasks = cardNames
+                .Select(cardName => DownloadWithThrottleAsync(cardName, targetFolder, semaphore));
 
-                if (downloaded)
-                    successCount++;
-                else
-                    failureCount++;
+            bool[] results = await Task.WhenAll(downloadTasks);
 
-                // Respect Scryfall's rate limit (2 req/s; 2 requests per card = 1s delay)
-                await Task.Delay(RateLimitDelay);
-            }
+            int successCount = results.Count(r => r);
+            int failureCount = results.Count(r => !r);
 
             Console.WriteLine();
             Console.WriteLine($"Scryfall download complete: {successCount} succeeded, {failureCount} failed.");
             Console.WriteLine();
+        }
+
+        /// <summary>
+        /// Acquires the semaphore slot before downloading so that at most
+        /// <see cref="MaxConcurrentDownloads"/> card images are fetched in parallel.
+        /// </summary>
+        private async Task<bool> DownloadWithThrottleAsync(string cardName, string targetFolder, SemaphoreSlim semaphore)
+        {
+            await semaphore.WaitAsync();
+            try
+            {
+                return await TryDownloadCardImageAsync(cardName, targetFolder);
+            }
+            finally
+            {
+                semaphore.Release();
+            }
         }
 
         private async Task<bool> TryDownloadCardImageAsync(string cardName, string targetFolder)
