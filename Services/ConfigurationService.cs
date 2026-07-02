@@ -4,10 +4,18 @@ using CardChooser.Services.Interfaces;
 namespace CardChooser.Services
 {
     /// <summary>
-    /// Service for loading and validating configuration.
+    /// Service for loading and validating application configuration from a key=value text file.
     /// </summary>
     public class ConfigurationService : IConfigurationService
     {
+        /// <summary>
+        /// Loads the application configuration from the specified file.
+        /// The file must use a simple "Key=Value" format, one entry per line.
+        /// Lines starting with '#' are treated as comments and are ignored.
+        /// </summary>
+        /// <param name="configFilePath">Path to the configuration file.</param>
+        /// <returns>A populated <see cref="AppConfiguration"/> instance.</returns>
+        /// <exception cref="FileNotFoundException">Thrown when the configuration file does not exist.</exception>
         public AppConfiguration LoadConfiguration(string configFilePath)
         {
             if (!File.Exists(configFilePath))
@@ -30,45 +38,31 @@ namespace CardChooser.Services
                 }
             }
 
-            if (configData.ContainsKey("InputCardsFile"))
-            {
-                config.InputCardsFile = configData["InputCardsFile"];
-            }
-            else
-            {
-                config.InputCardsFile = "cards.txt";
-            }
+            config.InputCardsFile = configData.ContainsKey("InputCardsFile")
+                ? configData["InputCardsFile"]
+                : "cards.txt";
 
-            if (configData.ContainsKey("SourceFolder"))
-            {
-                config.SourceFolder = configData["SourceFolder"];
-            }
-            else
-            {
-                config.SourceFolder = string.Empty;
-            }
+            config.SourceFolder = configData.ContainsKey("SourceFolder")
+                ? configData["SourceFolder"]
+                : string.Empty;
 
-            if (configData.ContainsKey("OutputFolder"))
-            {
-                config.OutputFolder = configData["OutputFolder"];
-            }
-            else
-            {
-                config.OutputFolder = string.Empty;
-            }
+            config.OutputFolder = configData.ContainsKey("OutputFolder")
+                ? configData["OutputFolder"]
+                : string.Empty;
 
-            if (configData.ContainsKey("MissingCardsReport"))
-            {
-                config.MissingCardsReport = configData["MissingCardsReport"];
-            }
-            else
-            {
-                config.MissingCardsReport = "missing_cards.txt";
-            }
+            config.MissingCardsReport = configData.ContainsKey("MissingCardsReport")
+                ? configData["MissingCardsReport"]
+                : "missing_cards.txt";
 
             return config;
         }
 
+        /// <summary>
+        /// Validates that the configuration contains all required values and that referenced paths exist.
+        /// Prints a descriptive error message to the console for each validation failure.
+        /// </summary>
+        /// <param name="config">The configuration to validate.</param>
+        /// <returns><c>true</c> if the configuration is valid; otherwise <c>false</c>.</returns>
         public bool ValidateConfiguration(AppConfiguration config)
         {
             if (string.IsNullOrWhiteSpace(config.SourceFolder))

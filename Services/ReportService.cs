@@ -4,10 +4,15 @@ using CardChooser.Services.Interfaces;
 namespace CardChooser.Services
 {
     /// <summary>
-    /// Service for generating and displaying reports.
+    /// Service for generating console output reports and saving the missing-cards file.
+    /// Single Responsibility: all user-facing reporting is centralised here.
     /// </summary>
     public class ReportService : IReportService
     {
+        /// <summary>
+        /// Writes the application header and current configuration settings to the console.
+        /// </summary>
+        /// <param name="config">The loaded application configuration.</param>
         public void DisplayHeader(AppConfiguration config)
         {
             Console.WriteLine("=== MTG Card Chooser ===");
@@ -17,6 +22,10 @@ namespace CardChooser.Services
             Console.WriteLine();
         }
 
+        /// <summary>
+        /// Writes a single line to the console reporting whether a card was found or is missing.
+        /// </summary>
+        /// <param name="cardInfo">The result of processing a single card.</param>
         public void DisplayCardProgress(CardInfo cardInfo)
         {
             Console.Write($"Searching for '{cardInfo.Name}'... ");
@@ -31,10 +40,16 @@ namespace CardChooser.Services
             }
         }
 
+        /// <summary>
+        /// Writes a final summary to the console showing totals for found cards, missing cards,
+        /// and files copied. Lists all missing card names if any are present.
+        /// </summary>
+        /// <param name="cards">The complete list of processed card results.</param>
+        /// <param name="totalFilesCopied">Total number of files copied to the output folder.</param>
         public void DisplaySummary(List<CardInfo> cards, int totalFilesCopied)
         {
-            var foundCards = cards.Where(c => c.Found).ToList();
-            var missingCards = cards.Where(c => !c.Found).Select(c => c.Name).ToList();
+            var foundCards = cards.Where(card => card.Found).ToList();
+            var missingCards = cards.Where(card => !card.Found).Select(card => card.Name).ToList();
 
             Console.WriteLine();
             Console.WriteLine("=== Summary ===");
@@ -61,6 +76,13 @@ namespace CardChooser.Services
             Console.WriteLine("Process completed successfully!");
         }
 
+        /// <summary>
+        /// Saves the list of missing card names to a text file inside the output folder.
+        /// Does nothing if the list is empty.
+        /// </summary>
+        /// <param name="missingCards">Names of cards that could not be found in the source folder.</param>
+        /// <param name="outputFolder">Destination folder where the report file will be written.</param>
+        /// <param name="reportFileName">Name of the report file (e.g. "missing_cards.txt").</param>
         public void GenerateMissingCardsReport(List<string> missingCards, string outputFolder, string reportFileName)
         {
             if (!missingCards.Any())
@@ -68,10 +90,10 @@ namespace CardChooser.Services
 
             string reportPath = Path.Combine(outputFolder, reportFileName);
             Console.WriteLine($"Creating missing cards report: {reportPath}");
-            
+
             var reportLines = new List<string> { "Missing Cards:" };
             reportLines.AddRange(missingCards);
-            
+
             File.WriteAllLines(reportPath, reportLines);
             Console.WriteLine($"Missing cards list saved to: {reportPath}");
             Console.WriteLine();

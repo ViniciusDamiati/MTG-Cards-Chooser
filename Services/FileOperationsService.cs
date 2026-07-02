@@ -3,13 +3,20 @@ using CardChooser.Services.Interfaces;
 namespace CardChooser.Services
 {
     /// <summary>
-    /// Service for file system operations.
+    /// Service for all file-system operations: scanning, searching, and copying card image files.
+    /// Caches the directory scan result so that repeated lookups do not re-read the disk.
     /// </summary>
     public class FileOperationsService : IFileOperationsService
     {
         private List<string>? _cachedFiles;
         private string? _cachedDirectory;
 
+        /// <summary>
+        /// Returns all file paths found under the given directory (recursive).
+        /// Results are cached per directory to avoid redundant disk reads within a single run.
+        /// </summary>
+        /// <param name="directory">Root directory to scan.</param>
+        /// <returns>A flat list of absolute file paths.</returns>
         public List<string> GetAllFiles(string directory)
         {
             if (_cachedDirectory == directory && _cachedFiles != null)
@@ -22,12 +29,19 @@ namespace CardChooser.Services
             return _cachedFiles;
         }
 
+        /// <summary>
+        /// Searches the source folder for files whose base name (after stripping metadata tokens)
+        /// matches the given card name using a case-insensitive comparison.
+        /// </summary>
+        /// <param name="cardName">The card name to search for.</param>
+        /// <param name="sourceFolder">The root folder to search within.</param>
+        /// <returns>A list of full file paths that match the card name.</returns>
         public List<string> SearchForCard(string cardName, string sourceFolder)
         {
             var allFiles = GetAllFiles(sourceFolder);
-            
+
             var matchingFiles = allFiles
-                .Where(file => 
+                .Where(file =>
                 {
                     string fileName = Path.GetFileNameWithoutExtension(file);
                     string extractedCardName = ExtractCardNameFromFileName(fileName);
@@ -40,11 +54,11 @@ namespace CardChooser.Services
 
         /// <summary>
         /// Extracts the card name from a filename by removing metadata in parentheses, brackets, and braces.
-        /// Example: "Rhystic Study (Normal) [JMP] {169}" -> "Rhystic Study"
+        /// Example: "Rhystic Study (Normal) [JMP] {169}" → "Rhystic Study"
         /// </summary>
-        /// <param name="fileName">The filename to extract from.</param>
-        /// <returns>The extracted card name.</returns>
-        private string ExtractCardNameFromFileName(string fileName)
+        /// <param name="fileName">The filename (without extension) to extract from.</param>
+        /// <returns>The extracted card name, trimmed of whitespace.</returns>
+        private static string ExtractCardNameFromFileName(string fileName)
         {
             if (string.IsNullOrWhiteSpace(fileName))
                 return string.Empty;
@@ -70,10 +84,16 @@ namespace CardChooser.Services
                 fileName = fileName.Substring(0, openBrace);
             }
 
-            // Trim any trailing whitespace
             return fileName.Trim();
         }
 
+        /// <summary>
+        /// Copies the given source files into the output folder, overwriting any existing files.
+        /// Logs each copied file to the console.
+        /// </summary>
+        /// <param name="sourceFiles">List of absolute source file paths to copy.</param>
+        /// <param name="outputFolder">Destination folder path.</param>
+        /// <returns>The number of files successfully copied.</returns>
         public int CopyFiles(List<string> sourceFiles, string outputFolder)
         {
             int copiedCount = 0;
@@ -83,7 +103,6 @@ namespace CardChooser.Services
                 string fileName = Path.GetFileName(sourceFile);
                 string destFile = Path.Combine(outputFolder, fileName);
 
-                // Overwrite existing files
                 File.Copy(sourceFile, destFile, true);
                 Console.WriteLine($"  Copied: {fileName}");
                 copiedCount++;
@@ -92,6 +111,11 @@ namespace CardChooser.Services
             return copiedCount;
         }
 
+        /// <summary>
+        /// Ensures the output folder exists, creating it (and any missing parent directories)
+        /// if it does not. Logs folder creation to the console.
+        /// </summary>
+        /// <param name="outputFolder">Path of the folder to ensure exists.</param>
         public void EnsureOutputFolderExists(string outputFolder)
         {
             if (!Directory.Exists(outputFolder))
