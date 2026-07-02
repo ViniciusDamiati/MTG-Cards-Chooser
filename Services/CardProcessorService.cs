@@ -4,39 +4,58 @@ using CardChooser.Services.Interfaces;
 namespace CardChooser.Services
 {
     /// <summary>
-    /// Service that orchestrates the card processing workflow.
-    /// Follows the Single Responsibility Principle by delegating specific tasks to specialized services.
+    /// Orchestrates the full card-processing workflow: loading configuration, scanning files,
+    /// copying found cards to the output folder, reporting missing cards, and downloading their
+    /// images from Scryfall.
+    /// Follows the Single Responsibility Principle by delegating specific tasks to specialised services.
     /// </summary>
     public class CardProcessorService : ICardProcessorService
     {
+        private const string ScryfallImagesFolder = "scryfall_images";
+        private const string CardArtsSubFolder = "cards_arts";
+
         private readonly IConfigurationService _configurationService;
         private readonly ICardParserService _cardParserService;
         private readonly IFileOperationsService _fileOperationsService;
         private readonly IReportService _reportService;
+        private readonly IScryfallService _scryfallService;
+        private readonly ICardArtExtractorService _cardArtExtractorService;
 
+        /// <summary>
+        /// Initialises a new instance of <see cref="CardProcessorService"/> with all required dependencies.
+        /// </summary>
+        /// <param name="configurationService">Service for loading and validating configuration.</param>
+        /// <param name="cardParserService">Service for parsing card names from the input file.</param>
+        /// <param name="fileOperationsService">Service for file-system search and copy operations.</param>
+        /// <param name="reportService">Service for console output and report generation.</param>
+        /// <param name="scryfallService">Service for downloading card images from the Scryfall API.</param>
+        /// <param name="cardArtExtractorService">Service for resizing and cropping Scryfall images to art-only files.</param>
         public CardProcessorService(
             IConfigurationService configurationService,
             ICardParserService cardParserService,
             IFileOperationsService fileOperationsService,
-            IReportService reportService)
+            IReportService reportService,
+            IScryfallService scryfallService,
+            ICardArtExtractorService cardArtExtractorService)
         {
-            _configurationService = configurationService;
-            _cardParserService = cardParserService;
-            _fileOperationsService = fileOperationsService;
-            _reportService = reportService;
+            _configurationService = configurationService ?? throw new ArgumentNullException(nameof(configurationService));
+            _cardParserService = cardParserService ?? throw new ArgumentNullException(nameof(cardParserService));
+            _fileOperationsService = fileOperationsService ?? throw new ArgumentNullException(nameof(fileOperationsService));
+            _reportService = reportService ?? throw new ArgumentNullException(nameof(reportService));
+            _scryfallService = scryfallService ?? throw new ArgumentNullException(nameof(scryfallService));
+            _cardArtExtractorService = cardArtExtractorService ?? throw new ArgumentNullException(nameof(cardArtExtractorService));
         }
 
-        public void ProcessCards(string configFilePath)
+        /// <inheritdoc />
+        public async Task ProcessCardsAsync(string configFilePath)
         {
             try
             {
                 // Load and validate configuration
                 var config = _configurationService.LoadConfiguration(configFilePath);
-                
+
                 if (!_configurationService.ValidateConfiguration(config))
-                {
                     return;
-                }
 
                 _reportService.DisplayHeader(config);
 
@@ -71,17 +90,28 @@ namespace CardChooser.Services
                     var cardInfo = ProcessCard(cardName, config.SourceFolder, config.OutputFolder);
                     processedCards.Add(cardInfo);
                     totalFilesCopied += cardInfo.MatchingFiles.Count;
-                    
+
                     _reportService.DisplayCardProgress(cardInfo);
                 }
 
-                // Generate reports
+                // Generate missing cards report
                 var missingCards = processedCards
-                    .Where(c => !c.Found)
-                    .Select(c => c.Name)
+                    .Where(card => !card.Found)
+                    .Select(card => card.Name)
                     .ToList();
 
                 _reportService.GenerateMissingCardsReport(missingCards, config.OutputFolder, config.MissingCardsReport);
+
+                // Download Scryfall images for missing cards, then extract art crops
+                if (missingCards.Count > 0)
+                {
+                    string scryfallImagesPath = Path.Combine(config.OutputFolder, ScryfallImagesFolder);
+                    await _scryfallService.DownloadCardImagesAsync(missingCards, scryfallImagesPath);
+
+                    string cardArtsPath = Path.Combine(scryfallImagesPath, CardArtsSubFolder);
+                    await _cardArtExtractorService.ExtractArtsAsync(scryfallImagesPath, cardArtsPath);
+                }
+
                 _reportService.DisplaySummary(processedCards, totalFilesCopied);
             }
             catch (FileNotFoundException ex)
@@ -96,12 +126,20 @@ namespace CardChooser.Services
             }
         }
 
+        /// <summary>
+        /// Searches for a single card in the source folder and copies any matching files
+        /// to the output folder. Returns a <see cref="CardInfo"/> with the result.
+        /// </summary>
+        /// <param name="cardName">The card name to search for.</param>
+        /// <param name="sourceFolder">Folder to search within.</param>
+        /// <param name="outputFolder">Folder to copy found files into.</param>
+        /// <returns>A <see cref="CardInfo"/> indicating whether the card was found and which files matched.</returns>
         private CardInfo ProcessCard(string cardName, string sourceFolder, string outputFolder)
         {
             var cardInfo = new CardInfo { Name = cardName };
-            
+
             var matchingFiles = _fileOperationsService.SearchForCard(cardName, sourceFolder);
-            
+
             if (matchingFiles.Any())
             {
                 cardInfo.Found = true;
@@ -112,7 +150,11 @@ namespace CardChooser.Services
             return cardInfo;
         }
 
-        private void DisplayConfigurationHelp()
+        /// <summary>
+        /// Prints a usage hint to the console explaining the required config.txt format.
+        /// Called when configuration loading fails with a <see cref="FileNotFoundException"/>.
+        /// </summary>
+        private static void DisplayConfigurationHelp()
         {
             Console.WriteLine("Please create a config.txt file with the following format:");
             Console.WriteLine("InputCardsFile=cards.txt");
