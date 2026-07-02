@@ -20,12 +20,15 @@ namespace CardChooser.Services
     internal sealed class CudaNppImagePipeline : IDisposable
     {
         // ── NPP DLL discovery ────────────────────────────────────────────────
-        // The three unmanaged DLLs our pipeline needs (CUDA Toolkit 12.x).
+        // DLLs required by our pipeline (CUDA Toolkit 12.2+, NPP API 13).
+        // nppidei64_13 is listed even though we bypass its broken Copy import,
+        // because ManagedCuda imports other functions (Set, etc.) from it.
         private static readonly string[] RequiredNppDlls =
         {
             "nppisu64_13",   // stream-context utilities  (NppStreamContext)
-            "nppig64_13",    // geometry transforms       (Resize, Copy)
+            "nppig64_13",    // geometry transforms       (Resize, nppiCopy_8u_C3R)
             "nppif64_13",    // image filtering           (FilterGaussBorder, FilterBorder)
+            "nppidei64_13",  // data exchange / init      (ManagedCuda import target for Set etc.)
         };
 
         // Standard root of CUDA Toolkit installs on Windows.
@@ -268,19 +271,17 @@ namespace CardChooser.Services
             using var gpuResized = new NPPImage_8uC3(targetW, targetH);
             gpuSrc.Resize(gpuResized, InterpolationMode.Cubic, _streamCtx);
 
-            // ── 4. Crop on GPU via SetRoi ─────────────────────────────────────
-            //    NPPImage_8uC3.Copy(dst, xOffset, yOffset) does NOT exist — that
-            //    overload resolves to the channel-extraction Copy(C1 dst, channelSrc)
-            //    and throws ArgumentOutOfRangeException when cropX > 2.
+            // ── 4. Crop on GPU via direct P/Invoke into nppig64_13 ────────────
+            //    ManagedCuda 2.12.0 has [DllImport("nppidei64_13")] for
+            //    nppiCopy_8u_C3R, but NVIDIA moved that function to nppig64_13
+            //    starting with CUDA 12.2 (NPP API 13).  Calling the managed
+            //    Copy() method therefore throws EntryPointNotFoundException.
             //
-            //    Correct idiom: restrict the source image to the desired rectangle
-            //    with SetRoi, then call the plain Copy(dst) which copies exactly
-            //    the ROI region into the (correctly sized) destination.
+            //    Fix: call nppiCopy_8u_C3R from nppig64_13 directly via our own
+            //    P/Invoke, computing the ROI source pointer manually from the
+            //    base DevicePointer + row/column byte offset.
             using var gpuCropped = new NPPImage_8uC3(cropW, cropH);
-            gpuResized.SetRoi(cropX, cropY, cropW, cropH);
-            gpuResized.Copy(gpuCropped);
-            // Reset so subsequent ROI checks on gpuResized see the full image.
-            gpuResized.SetRoi(0, 0, targetW, targetH);
+            CropOnGpu(gpuResized, cropX, cropY, gpuCropped);
 
             // ── 5. Gaussian denoise on GPU (3×3, Reflect boundary) ────────────
             using var gpuBlurred = new NPPImage_8uC3(cropW, cropH);
@@ -306,6 +307,52 @@ namespace CardChooser.Services
 
             // ── 8. BGR → SKBitmap (BGRA 8888, Alpha = 255) ──────────────────
             return RgbToSKBitmap(dstBgr, cropW, cropH);
+        }
+
+        // ════════════════════════════════════════════════════════════════════
+        // GPU crop helper — direct P/Invoke into nppig64_13
+        // ════════════════════════════════════════════════════════════════════
+
+        // ManagedCuda 2.12.0 declares nppiCopy_8u_C3R with [DllImport("nppidei64_13")]
+        // (Data Exchange and Initialization sub-library).  Starting with CUDA Toolkit
+        // 12.2 (NPP API 13) NVIDIA moved this function to nppig64_13 (Geometry).
+        // The managed wrapper therefore throws EntryPointNotFoundException at runtime.
+        //
+        // Fix: bypass ManagedCuda entirely and call the function from nppig64_13
+        // directly.  Device pointers are marshalled as ulong — CUdeviceptr supports
+        // an implicit conversion to ulong on 64-bit processes.
+        [DllImport("nppig64_13", CallingConvention = CallingConvention.Cdecl,
+                   EntryPoint = "nppiCopy_8u_C3R")]
+        private static extern int NppiCopy8uC3R(
+            ulong pSrc, int nSrcStep,    // source device pointer + pitch (bytes)
+            ulong pDst, int nDstStep,    // destination device pointer + pitch
+            NppiSize oSizeROI);          // {width, height} of the region to copy
+
+        /// <summary>
+        /// Extracts a sub-rectangle from <paramref name="src"/> starting at
+        /// (<paramref name="cropX"/>, <paramref name="cropY"/>) into
+        /// <paramref name="dst"/> (which must already be allocated at the crop size)
+        /// by calling <c>nppiCopy_8u_C3R</c> directly from <c>nppig64_13</c>.
+        /// </summary>
+        private static void CropOnGpu(
+            NPPImage_8uC3 src, int cropX, int cropY,
+            NPPImage_8uC3 dst)
+        {
+            // GPU pointer arithmetic: base + (row * pitch + col * bytesPerPixel).
+            // CUdeviceptr implicitly converts to ulong on a 64-bit process.
+            ulong srcBase   = src.DevicePointer;
+            ulong srcRoiPtr = srcBase + (ulong)((long)cropY * src.Pitch + cropX * 3);
+
+            int status = NppiCopy8uC3R(
+                srcRoiPtr,           src.Pitch,
+                dst.DevicePointer,   dst.Pitch,
+                new NppiSize(dst.Width, dst.Height));
+
+            if (status != 0)
+                throw new InvalidOperationException(
+                    $"nppiCopy_8u_C3R (nppig64_13) returned NPP status {status}. " +
+                    $"Crop region ({cropX},{cropY}) + {dst.Width}×{dst.Height} " +
+                    $"must fit inside the {src.Width}×{src.Height} source image.");
         }
 
         // ════════════════════════════════════════════════════════════════════

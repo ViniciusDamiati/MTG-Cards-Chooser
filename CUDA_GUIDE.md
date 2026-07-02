@@ -1048,6 +1048,52 @@ namespace YourNamespace
 
 ---
 
+### Pitfall 8: `EntryPointNotFoundException` for `nppiCopy_8u_C3R` in `nppidei64_13`
+
+**Symptom:** `EntryPointNotFoundException: Unable to find an entry point named 'nppiCopy_8u_C3R' in DLL 'nppidei64_13'.`  
+**Cause:** ManagedCuda 2.12.0 has `[DllImport("nppidei64_13")]` for `nppiCopy_8u_C3R`, but starting with **CUDA Toolkit 12.2** NVIDIA moved that function to `nppig64_13` (Geometry module). The DLL *loads* successfully (no `DllNotFoundException`) but the entry point is absent.
+
+**NPP DLL routing for CUDA 12.2+ (NPP API 13):**
+
+| DLL | Contains |
+|---|---|
+| `nppidei64_13` | Data Exchange & Initialization: `nppiSet_*`, `nppiConvert_*` |
+| `nppig64_13` | **Geometry**: `nppiCopy_8u_C3R`, `nppiResize_*`, `nppiRotate_*` |
+| `nppif64_13` | Filtering: `nppiFilterGauss_*`, `nppiFilterBorder_*` |
+
+**Fix:** bypass ManagedCuda's `Copy()` entirely and P/Invoke directly into the correct DLL:
+
+```csharp
+// ✅ Direct P/Invoke into nppig64_13 — bypasses ManagedCuda's wrong import
+[DllImport("nppig64_13", CallingConvention = CallingConvention.Cdecl,
+           EntryPoint = "nppiCopy_8u_C3R")]
+private static extern int NppiCopy8uC3R(
+    ulong pSrc, int nSrcStep,    // GPU pointer (CUdeviceptr → ulong) + row pitch
+    ulong pDst, int nDstStep,
+    NppiSize oSizeROI);
+
+private static void CropOnGpu(NPPImage_8uC3 src, int cropX, int cropY, NPPImage_8uC3 dst)
+{
+    // base + (row * pitch + col * 3 bytes per BGR pixel)
+    ulong srcRoiPtr = (ulong)src.DevicePointer
+                    + (ulong)((long)cropY * src.Pitch + cropX * 3);
+
+    int status = NppiCopy8uC3R(
+        srcRoiPtr,         src.Pitch,
+        dst.DevicePointer, dst.Pitch,
+        new NppiSize(dst.Width, dst.Height));
+
+    if (status != 0)
+        throw new InvalidOperationException($"nppiCopy_8u_C3R failed: {status}");
+}
+```
+
+> **Note:** pre-loading `nppig64_13` via `NativeLibrary.TryLoad(fullPath, out _)` ensures
+> the DLL is in the process's module table even when it was not in PATH, so the
+> `[DllImport("nppig64_13")]` P/Invoke resolves correctly.
+
+---
+
 ### Pitfall 7: `GenerateAssemblyInfo` conflict
 
 **Symptom:** Build error: `error CS0579: Duplicate 'System.Reflection.AssemblyVersionAttribute'`.  
