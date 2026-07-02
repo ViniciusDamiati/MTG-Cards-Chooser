@@ -21,6 +21,7 @@ namespace CardChooser
             IFileOperationsService fileOperationsService = new FileOperationsService();
             IReportService reportService = new ReportService();
             IScryfallService scryfallService = new ScryfallService(new HttpClient());
+            ICardArtExtractorService cardArtExtractorService = new CardArtExtractorService();
 
             // Create the main processor with all dependencies
             ICardProcessorService cardProcessorService = new CardProcessorService(
@@ -28,7 +29,8 @@ namespace CardChooser
                 cardParserService,
                 fileOperationsService,
                 reportService,
-                scryfallService
+                scryfallService,
+                cardArtExtractorService
             );
 
             // Execute the card processing workflow

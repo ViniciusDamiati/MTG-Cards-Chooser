@@ -12,12 +12,14 @@ namespace CardChooser.Services
     public class CardProcessorService : ICardProcessorService
     {
         private const string ScryfallImagesFolder = "scryfall_images";
+        private const string CardArtsSubFolder = "cards_arts";
 
         private readonly IConfigurationService _configurationService;
         private readonly ICardParserService _cardParserService;
         private readonly IFileOperationsService _fileOperationsService;
         private readonly IReportService _reportService;
         private readonly IScryfallService _scryfallService;
+        private readonly ICardArtExtractorService _cardArtExtractorService;
 
         /// <summary>
         /// Initialises a new instance of <see cref="CardProcessorService"/> with all required dependencies.
@@ -27,18 +29,21 @@ namespace CardChooser.Services
         /// <param name="fileOperationsService">Service for file-system search and copy operations.</param>
         /// <param name="reportService">Service for console output and report generation.</param>
         /// <param name="scryfallService">Service for downloading card images from the Scryfall API.</param>
+        /// <param name="cardArtExtractorService">Service for resizing and cropping Scryfall images to art-only files.</param>
         public CardProcessorService(
             IConfigurationService configurationService,
             ICardParserService cardParserService,
             IFileOperationsService fileOperationsService,
             IReportService reportService,
-            IScryfallService scryfallService)
+            IScryfallService scryfallService,
+            ICardArtExtractorService cardArtExtractorService)
         {
             _configurationService = configurationService ?? throw new ArgumentNullException(nameof(configurationService));
             _cardParserService = cardParserService ?? throw new ArgumentNullException(nameof(cardParserService));
             _fileOperationsService = fileOperationsService ?? throw new ArgumentNullException(nameof(fileOperationsService));
             _reportService = reportService ?? throw new ArgumentNullException(nameof(reportService));
             _scryfallService = scryfallService ?? throw new ArgumentNullException(nameof(scryfallService));
+            _cardArtExtractorService = cardArtExtractorService ?? throw new ArgumentNullException(nameof(cardArtExtractorService));
         }
 
         /// <inheritdoc />
@@ -97,11 +102,14 @@ namespace CardChooser.Services
 
                 _reportService.GenerateMissingCardsReport(missingCards, config.OutputFolder, config.MissingCardsReport);
 
-                // Download Scryfall images for missing cards
+                // Download Scryfall images for missing cards, then extract art crops
                 if (missingCards.Count > 0)
                 {
                     string scryfallImagesPath = Path.Combine(config.OutputFolder, ScryfallImagesFolder);
                     await _scryfallService.DownloadCardImagesAsync(missingCards, scryfallImagesPath);
+
+                    string cardArtsPath = Path.Combine(scryfallImagesPath, CardArtsSubFolder);
+                    await _cardArtExtractorService.ExtractArtsAsync(scryfallImagesPath, cardArtsPath);
                 }
 
                 _reportService.DisplaySummary(processedCards, totalFilesCopied);
