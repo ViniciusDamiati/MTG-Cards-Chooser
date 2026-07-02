@@ -271,17 +271,20 @@ namespace CardChooser.Services
             using var gpuResized = new NPPImage_8uC3(targetW, targetH);
             gpuSrc.Resize(gpuResized, InterpolationMode.Cubic, _streamCtx);
 
-            // ── 4. Crop on GPU via direct P/Invoke into nppig64_13 ────────────
-            //    ManagedCuda 2.12.0 has [DllImport("nppidei64_13")] for
-            //    nppiCopy_8u_C3R, but NVIDIA moved that function to nppig64_13
-            //    starting with CUDA 12.2 (NPP API 13).  Calling the managed
-            //    Copy() method therefore throws EntryPointNotFoundException.
-            //
-            //    Fix: call nppiCopy_8u_C3R from nppig64_13 directly via our own
-            //    P/Invoke, computing the ROI source pointer manually from the
-            //    base DevicePointer + row/column byte offset.
+            // ── 4. Crop via CPU round-trip ────────────────────────────────────
+            //    nppiCopy_8u_C3R cannot be reliably resolved at runtime:
+            //    - ManagedCuda 2.12.0 imports it from nppidei64_13 (wrong DLL)
+            //    - It is also absent from nppig64_13 on some CUDA 12.x builds
+            //    Rather than chasing per-version DLL routing, we do the crop on
+            //    the CPU.  PCIe cost: ~3 ms (37 MB ↓ + 14 MB ↑ on PCIe 4.0) —
+            //    negligible compared to the AI SR time (~10 s per card).
+            byte[] resizedBgr = new byte[targetW * targetH * 3];
+            gpuResized.CopyToHost(resizedBgr);
+
+            byte[] croppedBgr = ExtractRoiCpu(resizedBgr, targetW, cropX, cropY, cropW, cropH);
+
             using var gpuCropped = new NPPImage_8uC3(cropW, cropH);
-            CropOnGpu(gpuResized, cropX, cropY, gpuCropped);
+            gpuCropped.CopyToDevice(croppedBgr);
 
             // ── 5. Gaussian denoise on GPU (3×3, Reflect boundary) ────────────
             using var gpuBlurred = new NPPImage_8uC3(cropW, cropH);
@@ -310,54 +313,32 @@ namespace CardChooser.Services
         }
 
         // ════════════════════════════════════════════════════════════════════
-        // GPU crop helper — direct P/Invoke into nppig64_13
+        // Pixel format & image helpers
         // ════════════════════════════════════════════════════════════════════
-
-        // ManagedCuda 2.12.0 declares nppiCopy_8u_C3R with [DllImport("nppidei64_13")]
-        // (Data Exchange and Initialization sub-library).  Starting with CUDA Toolkit
-        // 12.2 (NPP API 13) NVIDIA moved this function to nppig64_13 (Geometry).
-        // The managed wrapper therefore throws EntryPointNotFoundException at runtime.
-        //
-        // Fix: bypass ManagedCuda entirely and call the function from nppig64_13
-        // directly.  Device pointers are marshalled as ulong — CUdeviceptr supports
-        // an implicit conversion to ulong on 64-bit processes.
-        [DllImport("nppig64_13", CallingConvention = CallingConvention.Cdecl,
-                   EntryPoint = "nppiCopy_8u_C3R")]
-        private static extern int NppiCopy8uC3R(
-            ulong pSrc, int nSrcStep,    // source device pointer + pitch (bytes)
-            ulong pDst, int nDstStep,    // destination device pointer + pitch
-            NppiSize oSizeROI);          // {width, height} of the region to copy
 
         /// <summary>
-        /// Extracts a sub-rectangle from <paramref name="src"/> starting at
-        /// (<paramref name="cropX"/>, <paramref name="cropY"/>) into
-        /// <paramref name="dst"/> (which must already be allocated at the crop size)
-        /// by calling <c>nppiCopy_8u_C3R</c> directly from <c>nppig64_13</c>.
+        /// Extracts a sub-rectangle from a packed BGR24 byte array.
+        /// Used for the Resize→Crop step because <c>nppiCopy_8u_C3R</c> cannot be
+        /// reliably located across CUDA Toolkit versions: ManagedCuda 2.12.0 imports
+        /// it from <c>nppidei64_13</c>, but it may be absent there <em>and</em> from
+        /// <c>nppig64_13</c> depending on the installed Toolkit revision.
+        /// The CPU round-trip (37 MB ↓ + 14 MB ↑) takes ~3 ms on PCIe 4.0 — negligible
+        /// beside the per-card AI SR time (~10 s).
         /// </summary>
-        private static void CropOnGpu(
-            NPPImage_8uC3 src, int cropX, int cropY,
-            NPPImage_8uC3 dst)
+        private static byte[] ExtractRoiCpu(
+            byte[] src, int srcWidth, int x, int y, int w, int h)
         {
-            // GPU pointer arithmetic: base + (row * pitch + col * bytesPerPixel).
-            // CUdeviceptr implicitly converts to ulong on a 64-bit process.
-            ulong srcBase   = src.DevicePointer;
-            ulong srcRoiPtr = srcBase + (ulong)((long)cropY * src.Pitch + cropX * 3);
-
-            int status = NppiCopy8uC3R(
-                srcRoiPtr,           src.Pitch,
-                dst.DevicePointer,   dst.Pitch,
-                new NppiSize(dst.Width, dst.Height));
-
-            if (status != 0)
-                throw new InvalidOperationException(
-                    $"nppiCopy_8u_C3R (nppig64_13) returned NPP status {status}. " +
-                    $"Crop region ({cropX},{cropY}) + {dst.Width}×{dst.Height} " +
-                    $"must fit inside the {src.Width}×{src.Height} source image.");
+            byte[] dst        = new byte[w * h * 3];
+            int srcRowBytes   = srcWidth * 3;
+            int dstRowBytes   = w * 3;
+            for (int row = 0; row < h; row++)
+            {
+                Array.Copy(src, (y + row) * srcRowBytes + x * 3,
+                           dst, row * dstRowBytes,
+                           dstRowBytes);
+            }
+            return dst;
         }
-
-        // ════════════════════════════════════════════════════════════════════
-        // Pixel format helpers
-        // ════════════════════════════════════════════════════════════════════
 
         /// <summary>BGRA 8888 (SkiaSharp) → BGR 24-bit for NPP C3.</summary>
         private static byte[] BgraToRgb(SKBitmap bmp)

@@ -431,18 +431,27 @@ private SKBitmap RunGpuPipeline(
     using var gpuResized = new NPPImage_8uC3(targetW, targetH);
     gpuSrc.Resize(gpuResized, InterpolationMode.Cubic, streamCtx);
 
-    // ── Step 4: Crop ROI on GPU via SetRoi ───────────────────────────────
-    // ⚠ Do NOT use Copy(dst, x, y) — that overload resolves to the
-    //   channel-extraction Copy(NPPImage_8uC1 dst, int channelSrc) and
-    //   throws ArgumentOutOfRangeException when x > 2.
-    //
-    // Correct idiom: set the ROI on the source to the desired sub-rectangle,
-    // then call the plain Copy(dst).  DevPtrRoi is automatically adjusted so
-    // only the ROI pixels are copied into the (correctly sized) destination.
+    // ── Step 4: Crop via CPU round-trip ──────────────────────────────────
+    // nppiCopy_8u_C3R is NOT reliably available:
+    //   - ManagedCuda 2.12.0 imports it from nppidei64_13 → EntryPointNotFoundException
+    //   - It may also be absent from nppig64_13 on some CUDA 12.x builds
+    // Fix: download the full resized image, crop on CPU (Array.Copy), re-upload.
+    // PCIe cost: ~3 ms (37 MB ↓ + 14 MB ↑ on PCIe 4.0) — negligible vs AI SR time.
+    byte[] resizedBgr = new byte[targetW * targetH * 3];
+    gpuResized.CopyToHost(resizedBgr);
+    byte[] croppedBgr = ExtractRoiCpu(resizedBgr, targetW, cropX, cropY, cropW, cropH);
     using var gpuCropped = new NPPImage_8uC3(cropW, cropH);
-    gpuResized.SetRoi(cropX, cropY, cropW, cropH);
-    gpuResized.Copy(gpuCropped);
-    gpuResized.SetRoi(0, 0, targetW, targetH); // restore full-image ROI
+    gpuCropped.CopyToDevice(croppedBgr);
+
+    // Helper:
+    static byte[] ExtractRoiCpu(byte[] src, int srcWidth, int x, int y, int w, int h)
+    {
+        byte[] dst = new byte[w * h * 3];
+        for (int row = 0; row < h; row++)
+            Array.Copy(src, (y + row) * srcWidth * 3 + x * 3,
+                       dst, row * w * 3, w * 3);
+        return dst;
+    }
 
     // ── Step 5: Gaussian denoise on GPU (3×3, border replication) ────────
     using var gpuBlurred = new NPPImage_8uC3(cropW, cropH);
@@ -1127,20 +1136,25 @@ using var dst = new NPPImage_8uC3(newWidth, newHeight);
 src.Resize(dst, InterpolationMode.Cubic, streamCtx);
 ```
 
-### Crop (Copy ROI via SetRoi)
+### Crop (CPU round-trip — avoid nppiCopy_8u_C3R)
 
-> ⚠ **Do NOT** use `src.Copy(dst, cropX, cropY)` — that overload resolves to the
-> channel-extraction signature `Copy(NPPImage_8uC1 dst, int channelSrc)` and throws
-> `ArgumentOutOfRangeException` when `cropX > 2`.
+> ⚠ **Do NOT** use `src.Copy(dst, cropX, cropY)` — wrong overload (`ArgumentOutOfRangeException` when `cropX > 2`).  
+> ⚠ **Do NOT** rely on `nppiCopy_8u_C3R` — ManagedCuda 2.12.0 imports it from `nppidei64_13` but it may be
+> absent there **and** from `nppig64_13` depending on the CUDA Toolkit revision (`EntryPointNotFoundException`).
 
 ```csharp
-// Correct idiom: narrow the source to the desired sub-rectangle with SetRoi,
-// then call the plain Copy(dst).  DevPtrRoi is adjusted automatically so only
-// the ROI pixels are transferred to the (correctly-sized) destination.
+// Reliable approach: download from GPU, crop on CPU, re-upload.
+// PCIe cost ~3 ms — negligible vs GPU compute time.
+byte[] resizedBgr = new byte[src.Width * src.Height * 3];
+src.CopyToHost(resizedBgr);
+
+byte[] croppedBgr = new byte[cropWidth * cropHeight * 3];
+for (int row = 0; row < cropHeight; row++)
+    Array.Copy(resizedBgr, (cropY + row) * src.Width * 3 + cropX * 3,
+               croppedBgr, row * cropWidth * 3, cropWidth * 3);
+
 using var dst = new NPPImage_8uC3(cropWidth, cropHeight);
-src.SetRoi(cropX, cropY, cropWidth, cropHeight);
-src.Copy(dst);
-src.SetRoi(0, 0, src.Width, src.Height); // restore full-image ROI
+dst.CopyToDevice(croppedBgr);
 ```
 
 ### Gaussian Blur
